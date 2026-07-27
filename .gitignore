@@ -226,7 +226,7 @@ AGENTS.md
 temp
 temp/*
 
-tmp
+tmp/
 
 wandb/*
 
