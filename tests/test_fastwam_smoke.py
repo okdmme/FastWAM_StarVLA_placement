@@ -153,6 +153,48 @@ class FastWAMSmokeTest(unittest.TestCase):
         self.assertEqual(tuple(outputs["video"].shape), tuple(video_state["tokens"].shape))
         self.assertEqual(tuple(outputs["action"].shape), tuple(action_state["tokens"].shape))
 
+    def test_forward_returns_action_loss_for_precomputed_latents(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg())
+        model.train()
+
+        batch = {
+            "input_latents": torch.randn(2, 4, 2, 2, 2),
+            "context": torch.randn(2, 5, 6),
+            "context_mask": torch.ones(2, 5, dtype=torch.bool),
+            "action": torch.randn(2, 1, 3),
+            "image_is_pad": torch.zeros(2, 2, dtype=torch.bool),
+            "action_is_pad": torch.zeros(2, 1, dtype=torch.bool),
+        }
+
+        out = model(batch)
+
+        self.assertIn("action_loss", out)
+        self.assertIn("loss_video", out)
+        self.assertIn("loss_action", out)
+        self.assertEqual(out["action_loss"].ndim, 0)
+        self.assertTrue(torch.isfinite(out["action_loss"]))
+
+        out["action_loss"].backward()
+        grad_params = [p for p in model.parameters() if p.grad is not None]
+        self.assertTrue(grad_params)
+
+    def test_compute_loss_routes_vla_batch(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg())
+        batch = {
+            "input_latents": torch.randn(2, 4, 2, 2, 2),
+            "context": torch.randn(2, 5, 6),
+            "context_mask": torch.ones(2, 5, dtype=torch.bool),
+            "action": torch.randn(2, 1, 3),
+        }
+
+        out = model.compute_loss("vla", batch)
+
+        self.assertIn("action_loss", out)
+        self.assertEqual(out["action_loss"].ndim, 0)
+        self.assertTrue(torch.isfinite(out["action_loss"]))
+
 
 if __name__ == "__main__":
     unittest.main()

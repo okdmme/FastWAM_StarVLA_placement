@@ -51,8 +51,8 @@ FastWAM を StarVLA 上で論文設定に近い形でフルスクラッチ学習
 - `FastWAM_ActionDiT.py`: 配置済み。
 - `FastWAM_WanVideoDiT.py`: 配置済み。StarVLA logger/import/checkpoint helper に合わせた最小変更のみ。
 - `FastWAM_MoT.py`: 配置済み。StarVLA の module import に合わせた最小変更のみ。
-- `FastWAM.py`: registry entry、expert 構築、MoT 接続、scheduler 吸収まで完了。
-- `tests/test_fastwam_smoke.py`: 追加済み。tiny config で scheduler、framework build、video/action expert と MoT の token-level forward を確認する。
+- `FastWAM.py`: registry entry、expert 構築、MoT 接続、scheduler 吸収、precomputed latent training loss まで完了。
+- `tests/test_fastwam_smoke.py`: 追加済み。tiny config で scheduler、framework build、video/action expert と MoT の token-level forward、precomputed latent forward/backward を確認する。
 
 ## Smoke Test Scope
 
@@ -62,12 +62,29 @@ FastWAM を StarVLA 上で論文設定に近い形でフルスクラッチ学習
 - `WanContinuousFlowMatchScheduler` の timestep/noise/weight shape が training loss 用に使えるか。
 - `WanVideoDiT.pre_dit()` と `ActionDiT.pre_dit()` が MoT へ渡す token/freq/context/timestep modulation の shape 契約を満たすか。
 - MoT が video expert と action expert を同じ layer interface で扱えるか。
+- `input_latents/context/context_mask/action` が事前計算済みの場合に `FastWAM.forward()` が `action_loss` を返し、backward できるか。
+- StarVLA trainer 互換の `compute_loss("vla", batch)` 経由でも `action_loss` を返せるか。
 
-この段階では VAE/text encoder、dataset adapter、`training_loss()` 本体はまだ確認対象外。
+この段階では VAE/text encoder と dataset adapter はまだ確認対象外。
+
+## Training Loss Integration
+
+公式 FastWAM の `training_loss()` は `build_inputs()` で video を VAE latent 化し、text encoder で context を作る前提だった。
+StarVLA 側では VAE/text encoder の再利用方針をまだ確定していないため、先に以下の precomputed sample 経路を実装した。
+
+- `input_latents`: `[B, C, T, H, W]`
+- `context`: `[B, L, D]`
+- `context_mask`: `[B, L]`
+- `action`: `[B, T_action, action_dim]`
+- optional `image_is_pad`: latent step に揃えた `[B, T_latent]`
+- optional `action_is_pad`: `[B, T_action]`
+
+この形なら StarVLA trainer が `compute_loss("vla", batch)` から `FastWAM.forward()` を呼び、`{"action_loss": loss}` を受け取れる。
+画像列から `input_latents/context` を作る処理は、既存 `Wan2.py`/diffusers 経路を再利用できるか確認した上で次に接続する。
 
 ## Next Work
 
-1. `FastWAM.training_loss()` を `FastWAMFramework.forward()` に移植する。
-2. StarVLA batch から FastWAM が必要とする `video/action/proprio/prompt` sample 形式への adapter を決める。
-3. VAE/text encoder はまず StarVLA 既存 `Wan2.py`/diffusers 経路を再利用できるか確認する。
-4. 再利用できない場合だけ、公式 FastWAM の loader/helper を既存 module 配下へ最小配置する。
+1. StarVLA batch から FastWAM が必要とする `input_latents/context/context_mask/action` 形式への adapter を決める。
+2. VAE/text encoder はまず StarVLA 既存 `Wan2.py`/diffusers 経路を再利用できるか確認する。
+3. 再利用できない場合だけ、公式 FastWAM の loader/helper を既存 module 配下へ最小配置する。
+4. `predict_action()` 側に `infer_action()` を移植する。
