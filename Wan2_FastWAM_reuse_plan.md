@@ -1234,3 +1234,28 @@ StarVLA 既存 module 配下に置くべき。
 4. 難しければ `framework/WM4A/FastWAM_MoT.py` として配置する
 5. `WanFastWAM.py` を `Wan2 hidden states -> ActionDiT` ではなく、
    `FastWAM_WanVideoDiT + FastWAM_ActionDiT + MoT` の構成へ置き換える
+
+### Step 5 実装結果
+
+配置済み:
+- `starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py`
+- `starVLA/model/framework/WM4A/FastWAM_MoT.py`
+
+`FastWAM_WanVideoDiT.py`:
+- FastWAM 公式 `src/fastwam/models/wan22/wan_video_dit.py` を配置
+- StarVLA 向けに logger と gradient checkpoint helper import だけ調整
+- 公式との差分は import 周辺のみ
+- `python -m py_compile starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py` 成功
+
+`FastWAM_MoT.py`:
+- FastWAM 公式 `src/fastwam/models/wan22/mot.py` を `framework/WM4A` 直下に配置
+- `WanFastWAM.py` へ直接吸収するには 556 行と大きく、framework 入口の見通しが悪くなるため分離した
+- 新規 folder は作っていない
+- StarVLA 向けに helper import と logger だけ調整
+- 公式との差分は import 周辺のみ
+- `python -m py_compile starVLA/model/framework/WM4A/FastWAM_MoT.py` 成功
+
+次に必要な作業:
+- `WanFastWAM.py` を `FastWAM_WanVideoDiT + FastWAM_ActionDiT + FastWAM_MoT` で構築する形へ置き換える
+- そのために `FastWAM.training_loss()` の StarVLA 版を `WanFastWAM.forward()` へ移植する
+- VAE/text encoder はまず既存 `Wan2.py` のものを再利用するか、FastWAM 公式 loader が必要かを判断する
