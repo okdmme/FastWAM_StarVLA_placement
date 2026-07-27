@@ -109,9 +109,18 @@ class CrossAttention(nn.Module):
         return self.o(flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=ctx_mask))
 
 
+class GateModule(nn.Module):
+    def forward(self, x, gate, residual):
+        return x + gate * residual
+
+
 class DiTBlock(nn.Module):
     def __init__(self, hidden_dim: int, attn_head_dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.attn_head_dim = attn_head_dim
+        self.num_heads = num_heads
+        self.ffn_dim = ffn_dim
         self.self_attn = SelfAttention(hidden_dim, attn_head_dim, num_heads, eps)
         self.cross_attn = CrossAttention(hidden_dim, attn_head_dim, num_heads, eps)
         self.norm1 = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
@@ -123,6 +132,7 @@ class DiTBlock(nn.Module):
             nn.Linear(ffn_dim, hidden_dim),
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
+        self.gate = GateModule()
 
     def forward(self, x, context, t_mod, freqs, context_mask=None, self_attn_mask: Optional[torch.Tensor] = None):
         if context_mask is not None and context_mask.dim() == 3:

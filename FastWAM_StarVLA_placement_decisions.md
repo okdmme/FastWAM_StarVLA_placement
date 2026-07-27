@@ -52,6 +52,18 @@ FastWAM を StarVLA 上で論文設定に近い形でフルスクラッチ学習
 - `FastWAM_WanVideoDiT.py`: 配置済み。StarVLA logger/import/checkpoint helper に合わせた最小変更のみ。
 - `FastWAM_MoT.py`: 配置済み。StarVLA の module import に合わせた最小変更のみ。
 - `FastWAM.py`: registry entry、expert 構築、MoT 接続、scheduler 吸収まで完了。
+- `tests/test_fastwam_smoke.py`: 追加済み。tiny config で scheduler、framework build、video/action expert と MoT の token-level forward を確認する。
+
+## Smoke Test Scope
+
+この smoke test は、実データや Wan2.2 本番重みを使わず、以下の破損を早く検出する目的で置く。
+
+- `FastWAM` が StarVLA の `build_framework()` 経由で構築できるか。
+- `WanContinuousFlowMatchScheduler` の timestep/noise/weight shape が training loss 用に使えるか。
+- `WanVideoDiT.pre_dit()` と `ActionDiT.pre_dit()` が MoT へ渡す token/freq/context/timestep modulation の shape 契約を満たすか。
+- MoT が video expert と action expert を同じ layer interface で扱えるか。
+
+この段階では VAE/text encoder、dataset adapter、`training_loss()` 本体はまだ確認対象外。
 
 ## Next Work
 
