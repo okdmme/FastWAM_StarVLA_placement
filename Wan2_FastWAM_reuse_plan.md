@@ -813,3 +813,258 @@ Step 2 で残した機能だけを、
 
 不要と判断した FastWAM 由来 `world_model` ファイルを整理し、
 残すファイルを最小化する。
+
+## 方針修正: フル FastWAM を StarVLA 既存 module に載せる
+
+ここまでの作業は、StarVLA 既存 `Wan2.py` を維持したうえで
+FastWAM ActionDiT を action head として試す「最小統合」に寄っていた。
+
+しかし最終目標は次の通り。
+
+- FastWAM を StarVLA 上の既存 module 構造にできるだけ吸収する
+- 新しい folder/file は最小限にする
+- FastWAM 論文相当の video/action joint model をフルスクラッチ学習できるようにする
+- 単なる `Wan2 hidden states -> ActionDiT` ではなく、FastWAM の `MoT` 経由 training を再現する
+
+したがって、今後の優先順位は修正する。
+
+### 現状の到達点
+
+現在 StarVLA に入っている FastWAM 関連実装:
+
+- `starVLA/model/modules/action_model/FastWAM_ActionDiT.py`
+  - FastWAM の `action_dit.py` を StarVLA action model 配下に移したもの
+  - `ActionDiT`, `FastWAMActionDiTHead`, `get_action_model()` を持つ
+  - StarVLA 既存 action head と同じ factory 形式では使える
+  - ただし FastWAM 本来の `MoT` mixed-attention training 経路にはまだ接続されていない
+
+- `starVLA/model/framework/WM4A/WanFastWAM.py`
+  - `framework.name: WanFastWAM` として registry には乗っている
+  - 現状は `Wan2.py` の hidden states を `FastWAM_ActionDiT` に渡す薄い wrapper
+  - FastWAM 本体の `training_loss()` / `MoT` / video loss はまだ入っていない
+
+- `starVLA/model/modules/world_model/Wan2.py`
+  - FastWAM 由来の token-wise timestep 構成を一部追加済み
+  - ただし diffusers `WanTransformer3DModel` wrapper のまま
+  - `pre_dit()`, `post_dit()`, `build_video_to_video_mask()`, action-conditioned context は未実装
+
+### FastWAM ファイルごとの StarVLA 対応先
+
+#### `action_dit.py`
+
+対応先:
+- `starVLA/model/modules/action_model/FastWAM_ActionDiT.py`
+
+判断:
+- ここに置く方針は正しい
+- StarVLA 既存 `DiT_modules/models.py` の `DiTBlock` とは構造が違うため、既存 DiT に置き換えない
+- 今後は wrapper 用の `FastWAMActionDiTHead` だけでなく、MoT から直接 `ActionDiT.pre_dit/post_dit` を使う経路を残す必要がある
+
+#### `wan_video_dit.py`
+
+対応先:
+- 第一候補: `starVLA/model/modules/world_model/Wan2.py`
+
+判断:
+- FastWAM の video expert は world model 配下の責務なので、対応先は `Wan2.py`
+- ただし現在の `Wan2.py` は diffusers transformer を一括 forward する wrapper
+- FastWAM の `WanVideoDiT` は block ごとの `pre_dit/post_dit` と q/k/v mixed-attention を前提にする
+- そのため、`Wan2.py` へ「設定だけ追加」では MoT 連携を再現できない
+
+必要な未吸収機能:
+- patchify / unpatchify
+- `pre_dit()` / `post_dit()`
+- `build_video_to_video_mask()`
+- token-wise timestep modulation
+- action-conditioned context
+- RoPE helper / DiTBlock helper
+- FastWAM 形式の denoising output
+
+配置方針:
+- 新しい subfolder は作らない
+- まず `Wan2.py` に FastWAM backend mode を追加できるか検討する
+- もし `Wan2.py` が大きくなりすぎる場合でも、追加ファイルは `world_model` 直下の最小数に留める
+
+#### `mot.py`
+
+対応先:
+- 第一候補: `starVLA/model/framework/WM4A/WanFastWAM.py`
+
+判断:
+- MoT は単独 world model ではなく、video expert と action expert を layer-wise に混ぜる orchestration
+- StarVLA の既存構造では framework が action/world model を組み合わせる責務を持つ
+- そのため、まずは `WanFastWAM.py` に吸収するのが最小変更
+
+注意:
+- `MoT` は `wan_video_dit.py` の helper (`flash_attention`, `modulate`, `rope_apply`) に依存する
+- これらはすでに `FastWAM_ActionDiT.py` にも重複して移されている
+- 重複を避けるなら、最終的には StarVLA 既存 module 内で共有位置を考える必要がある
+- ただし新規フォルダを増やさない方針なので、まずは既存ファイル内への吸収を優先する
+
+#### `fastwam.py`
+
+対応先:
+- `starVLA/model/framework/WM4A/WanFastWAM.py`
+
+判断:
+- `FastWAM.training_loss()` は StarVLA では framework の `forward()` / `compute_loss()` に対応する
+- 現在の `WanFastWAM.forward()` は action loss のみ
+- フル FastWAM では video loss と action loss の両方を返す必要がある
+
+必要な未吸収機能:
+- `build_inputs(sample)`
+- VAE encode/decode helper
+- text/context handling
+- proprio context append
+- video/action scheduler
+- `training_loss()`
+- `_predict_joint_noise()`
+- `infer_joint()`
+- `infer_action()`
+
+#### `fastwam_joint.py`
+
+対応先:
+- `starVLA/model/framework/WM4A/WanFastWAM.py`
+
+判断:
+- `FastWAMJoint` は attention mask policy の variant
+- まず `WanFastWAM.py` の config option として吸収するのがよい
+- 追加 framework ファイルを作るのは後回し
+
+#### `fastwam_idm.py`
+
+対応先:
+- `starVLA/model/framework/WM4A/WanFastWAM.py`
+
+判断:
+- IDM は training objective / attention mask variant
+- 最初から別ファイル化せず、`WanFastWAM.py` 内の mode として扱えるか検討する
+
+#### `scheduler_continuous.py`
+
+対応先:
+- 第一候補: `starVLA/model/framework/WM4A/WanFastWAM.py`
+- 第二候補: `starVLA/model/modules/world_model/Wan2.py`
+
+判断:
+- FastWAM では video/action 両方で同じ scheduler class を使う
+- StarVLA 既存 action heads に flow matching scheduler 類はあるが、FastWAM の `WanContinuousFlowMatchScheduler` と同一ではない
+- まずは `WanFastWAM.py` に吸収し、重複が明らかになったら既存 action_model 側へ寄せる
+
+#### `wan_video_vae.py`
+
+対応先:
+- `starVLA/model/modules/world_model/Wan2.py`
+
+判断:
+- StarVLA の `Wan2.py` は diffusers `AutoencoderKLWan` を使っている
+- FastWAM の `WanVideoVAE38` は独自 API (`encode(video, device, tiled, ...)`) を持つ
+- フルスクラッチ学習で diffusers VAE をそのまま使えるなら新規移植は不要
+- ただし `FastWAM.training_loss()` の VAE API と shape/normalization が合うように adapter が必要
+
+#### `wan_video_text_encoder.py`
+
+対応先:
+- `starVLA/model/modules/world_model/Wan2.py`
+
+判断:
+- StarVLA `Wan2.py` は `UMT5EncoderModel` + `T5TokenizerFast` を既に使う
+- FastWAM 独自 text encoder/tokenizer を丸ごと追加する優先度は低い
+- ただし FastWAM の `context/context_mask` 前提と StarVLA dataloader の instruction encoding を揃える必要がある
+
+#### `helpers/loader.py`, `helpers/io.py`, `helpers/state_dict_converters.py`
+
+対応先:
+- `starVLA/model/modules/world_model/Wan2.py`
+
+判断:
+- diffusers/HF 形式の pretrained を使うだけなら既存 `Wan2.py` の loader で代替可能
+- FastWAM 独自 checkpoint または converted Wan weights を読むなら必要部分だけ `Wan2.py` に吸収する
+- フルスクラッチ学習開始だけなら優先度は中程度
+
+#### `helpers/gradient.py`
+
+対応先:
+- 既に `FastWAM_ActionDiT.py` に一部吸収済み
+- `Wan2.py` / `WanFastWAM.py` 側にも必要なら同様に局所吸収
+
+### StarVLA 既存ファイルでそのまま使えるもの
+
+- framework registry / build:
+  - `starVLA/model/framework/base_framework.py`
+  - `framework.name: WanFastWAM` は registry に乗る
+
+- world model entry:
+  - `starVLA/model/modules/world_model/__init__.py`
+  - 既存 `get_world_model(config)` は使えるが、FastWAM 本体では `Wan2.py` の通常 forward だけでは不足
+
+- Wan2 VAE/text loading:
+  - `starVLA/model/modules/world_model/Wan2.py`
+  - VAE/text encoder/tokenizer は原則再利用候補
+
+- action model location:
+  - `starVLA/model/modules/action_model/FastWAM_ActionDiT.py`
+  - 既存 action_model 配下に置く判断は正しい
+
+- trainer loss routing:
+  - `baseframework.compute_loss()` は `forward()` が返す tensor dict を扱える
+  - `WanFastWAM.forward()` が `video_loss`, `action_loss`, `loss` などを返す形にすれば既存 trainer に乗せやすい
+
+### StarVLA 既存ファイルだけでは不足しているもの
+
+- MoT mixed attention
+- video expert の `pre_dit/post_dit`
+- video denoising loss
+- action/video joint noise schedule
+- FastWAM 用 sample builder
+  - `video [B,3,T,H,W]`
+  - `action [B,T,A]`
+  - `context/context_mask`
+  - `action_is_pad`
+  - `image_is_pad`
+- FastWAM inference
+  - `infer_joint`
+  - `infer_action`
+  - video KV cache action-only inference
+
+### 修正後の優先順位
+
+1. `Wan2.py` に FastWAM video expert 相当を吸収できるかを設計する
+   - `pre_dit/post_dit`
+   - `build_video_to_video_mask`
+   - FastWAM denoising output
+   - diffusers `WanTransformer3DModel` を使い続けられるか、独自 block 実装が必要かを最終判断する
+
+2. `WanFastWAM.py` を現在の薄い wrapper から FastWAM 本体へ近づける
+   - `FastWAM.training_loss()` を StarVLA `forward()` に移す
+   - `MoT` をまず `WanFastWAM.py` 内へ吸収する方針で検討する
+   - video/action loss を返す
+
+3. dataloader bridge を確認する
+   - StarVLA の LeRobot batch が FastWAM `sample` 形式に変換できるか確認する
+   - 既存 dataloader に手を入れるか、`WanFastWAM.forward()` 内で変換するか判断する
+
+4. `fastwam_joint.py` / `fastwam_idm.py` は variant として後から吸収する
+   - 最初から新規 framework file を増やさない
+   - config mode として扱えるかを優先する
+
+5. loader / state_dict converter は最後に判断する
+   - フルスクラッチ学習に不要なら移植しない
+   - pretrained initialization が必要になったら `Wan2.py` の loader 経路へ必要部分だけ吸収する
+
+### 現時点の重要な判断
+
+`Wan2.py` の diffusers wrapper だけでは FastWAM の MoT training を再現しにくい。
+
+理由:
+- MoT は各 layer で video/action expert の q/k/v を取り出して mixed attention する
+- diffusers `WanTransformer3DModel` はその内部 q/k/v を StarVLA wrapper から自然には取り出せない
+- FastWAM の `WanVideoDiT` はそのために `pre_dit/post_dit` と block-level API を持っている
+
+したがって次の設計判断が必要。
+
+1. `Wan2.py` に FastWAM 独自 block-level backend を吸収する
+2. diffusers `WanTransformer3DModel` を改造/subclass 化して MoT に必要な q/k/v 経路を開く
+
+新規フォルダを増やさない方針では、まず 1 を `Wan2.py` 内でどこまで可能か確認する。
