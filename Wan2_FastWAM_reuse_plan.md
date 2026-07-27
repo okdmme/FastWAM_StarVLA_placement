@@ -521,6 +521,273 @@ FastWAM 寄り挙動:
   `non_first_frame_timestep != 0` が期待どおり受けられるか
 - 現在の環境には `diffusers` が入っていないため、実 forward の確認は未実施
 
+## Step 2-2. `video_attention_mask_mode` の実現可能性確認
+
+確認対象:
+- `FastWAM_WanVideoDiT.py` の `build_video_to_video_mask()`
+- diffusers `WanTransformer3DModel`
+- 既存 `Wan2.py` wrapper
+
+### 確認結果
+
+diffusers の `WanTransformer3DModel.forward()` は公開 API として
+`attention_kwargs` を受け取る。
+
+ただし、公式実装を見る限り、Wan の transformer block 内では
+self-attention 呼び出し時に attention mask が渡されていない。
+
+具体的には、`WanTransformerBlock.forward()` では self-attention が概ね次の形で呼ばれている。
+
+```python
+attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+```
+
+ここで第3引数にあたる attention mask は `None` で固定されている。
+
+また、`WanTransformer3DModel.forward()` 側も各 block を
+
+```python
+hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+```
+
+の形で呼んでおり、video self-attention mask を block に渡す経路がない。
+
+### 判断
+
+`Wan2.py` の wrapper だけで `video_attention_mask_mode` を実現するのは難しい。
+
+理由:
+- `Wan2.py` から `attention_kwargs` を渡しても、Wan block の self-attention mask 引数に接続されていない
+- `FastWAM_WanVideoDiT.py` のような `build_video_to_video_mask()` を作っても、diffusers backend に自然に差し込む場所がない
+- 実装するには、diffusers の `WanTransformerBlock.forward()` 相当を変更するか、独自 backend に差し替える必要がある
+
+### 結論
+
+`video_attention_mask_mode` は Step 2 では採用しない。
+
+理由:
+- 既存 `Wan2.py` を使う方針から外れ、diffusers backend の内部改変に近くなる
+- 「StarVLA の既存 Wan2 を用いる」という説明が弱くなる
+- FastWAM の `MoT` / action-only 推論設計に近い機能であり、現段階の world-model wrapper 改修としては大きすぎる
+
+### 今後必要になった場合の選択肢
+
+1. diffusers `WanTransformer3DModel` を subclass / wrapper 化して block forward に mask を通す
+2. `FastWAM_WanVideoDiT.py` の独自 backbone を正式採用する
+3. `video_attention_mask_mode` は world model ではなく、将来の FastWAM 統合層で扱う
+
+現時点の推奨は 3。
+
+つまり、今は `Wan2.py` を維持し、
+`video_attention_mask_mode` は保留扱いにする。
+
+## Step 2-3. `FastWAM_ActionDiT.py` の依存整理
+
+対象:
+- `starVLA/starVLA/model/modules/action_model/FastWAM_ActionDiT.py`
+- `starVLA/starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py`
+- `starVLA/starVLA/model/modules/world_model/FastWAM_gradient.py`
+- `starVLA/starVLA/model/modules/world_model/FastWAM_scheduler_continuous.py`
+
+### 確認結果
+
+`FastWAM_ActionDiT.py` は、もともと `FastWAM_WanVideoDiT.py` から以下を import していた。
+
+- `DiTBlock`
+- `sinusoidal_embedding_1d`
+- `precompute_freqs_cis`
+
+また、`FastWAM_gradient.py` から以下を import していた。
+
+- `gradient_checkpoint_forward`
+
+StarVLA 既存の `action_model/DiT_modules/models.py` にも `DiTBlock` はあるが、
+構造が異なる。
+
+FastWAM の `ActionDiT` が必要とする block は:
+- RoPE self-attention
+- text context cross-attention
+- timestep modulation
+- gate 付き residual
+
+一方、StarVLA 既存 `DiT_modules.models.DiTBlock` は通常の DiT block であり、
+FastWAM `ActionDiT` の block と互換ではない。
+
+### 判断
+
+`FastWAM_ActionDiT.py` は action model として残す価値がある。
+
+ただし、`world_model/FastWAM_WanVideoDiT.py` に依存させるのは不自然。
+
+理由:
+- `FastWAM_WanVideoDiT.py` は world model 側の独自 video backbone
+- `ActionDiT` が必要としているのは、その中の小さな transformer 部品だけ
+- world model 側に独自 backbone 全体を残すと、既存 `Wan2.py` 再利用方針と矛盾する
+
+### 実施内容
+
+`FastWAM_ActionDiT.py` を自己完結させた。
+
+具体的には、以下を `FastWAM_ActionDiT.py` 内に移した。
+
+- `gradient_checkpoint_forward`
+- `flash_attention`
+- `modulate`
+- `sinusoidal_embedding_1d`
+- `precompute_freqs_cis`
+- `rope_apply`
+- `RMSNorm`
+- `SelfAttention`
+- `CrossAttention`
+- `DiTBlock`
+
+また、FastWAM 固有 logger 依存を削除し、
+StarVLA 既存の `initialize_overwatch` に置き換えた。
+
+### 削除した未追跡ファイル
+
+以下はコード上の参照がなくなったため削除した。
+
+- `starVLA/starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py`
+- `starVLA/starVLA/model/modules/world_model/FastWAM_gradient.py`
+- `starVLA/starVLA/model/modules/world_model/FastWAM_scheduler_continuous.py`
+
+### 現在残すファイル
+
+- `starVLA/starVLA/model/modules/action_model/FastWAM_ActionDiT.py`
+
+このファイルは、FastWAM 側の action expert 候補として `action_model` 配下に置く。
+
+### 追加した StarVLA 入口
+
+`FastWAM_ActionDiT.py` に `FastWAMActionDiTHead` と `get_action_model(config=None)` を追加した。
+
+目的:
+- StarVLA 既存 action head と同じ factory 形式に寄せる
+- `config.framework.action_model` から StarVLA 互換 action head を構築できるようにする
+- 外側からは `forward(vl_embs, actions, state)` と `predict_action(vl_embs, state)` を呼べるようにする
+- pretrained payload が指定された場合だけ `ActionDiT.from_pretrained()` を使う
+- pretrained 指定がない場合は通常の `ActionDiT(**config)` で構築し、呼び出し側の device/dtype 管理を邪魔しない
+
+config の読み方:
+- `action_dit_config` があれば、その mapping を優先する
+- なければ `action_hidden_dim`, `action_dim`, `ffn_dim`, `text_dim`, `freq_dim`, `num_heads`, `attn_head_dim`, `num_layers`, `eps`, `use_gradient_checkpointing` から組み立てる
+
+`FastWAMActionDiTHead` の役割:
+- StarVLA framework が渡す world-model feature `vl_embs` を `ActionDiT` の `context` として使う
+- action chunk に flow-matching 風の noise/time を加えて MSE loss を返す
+- inference では Euler update で action chunk を生成する
+- `state_dim` が設定されている場合は state を 1 token として context 末尾に追加する
+
+### 確認済み
+
+- `python3 -m py_compile starVLA/model/modules/action_model/FastWAM_ActionDiT.py`
+- `python3 -m py_compile starVLA/model/modules/world_model/Wan2.py`
+
+どちらも成功。
+
+未確認:
+- この作業環境には `torch` import 可能な実行環境が無いため、dummy forward/predict の runtime 検証は未実施
+- PyTorch が入った StarVLA 実行環境で shape test が必要
+
+### 次の作業
+
+`FastWAM_ActionDiT.py` を StarVLA の action model routing からどう呼ぶかを検討する。
+
+候補:
+- 既存 `action_model/__init__.py` または model builder がある場合、そこに `FastWAM_ActionDiT` を登録する
+- framework config 側に `action_model_type` または `action_model_name` で選択できる設定を追加する
+- routing 追加前に、既存の action model import 経路を確認する
+
+最小方針は、既存の action model 選択機構を壊さず、
+`FastWAM_ActionDiT.get_action_model(config)` を選べる分岐だけを追加すること。
+
+ただし現在の StarVLA は中央 action-model registry を持たず、
+各 framework が個別に action head を import している。
+そのため、次に変更すべき対象は以下のどちらかを選ぶ必要がある。
+
+- `WanGR00T.py` を FastWAM action head に切り替えられるようにする
+- `WanFastWAM.py` のような専用 framework を追加し、既存 `WanGR00T/WanPI` は触らない
+
+### 実施した routing 方針
+
+専用 framework 方針を採用した。
+
+追加ファイル:
+- `starVLA/starVLA/model/framework/WM4A/WanFastWAM.py`
+
+登録名:
+- `WanFastWAM`
+
+理由:
+- 既存 `WanGR00T.py` / `WanPI.py` の挙動を変えない
+- FastWAM action head の検証を独立した framework 名で行える
+- 問題が出た場合も `framework.name: WanFastWAM` を使っている設定だけに影響を限定できる
+
+構成:
+- world model は既存 `get_world_model(config)` を利用
+- Wan hidden state は `wm_projector` で `ActionDiT` の `text_dim` に射影
+- action head は `FastWAM_ActionDiT.get_action_model(config)` から取得
+- training は `forward(vl_embs, actions, state)` 互換 wrapper 経由で action loss を返す
+- inference は `predict_action(vl_embs, state)` 互換 wrapper 経由で normalized action を返す
+
+### ブランチ方針
+
+作成したブランチ:
+- `develop`: `upstream/starVLA_dev` と同じ位置。公式実装に何も足していない基準ブランチ
+- `fastwam-starvla-integration`: FastWAM 統合作業用ブランチ
+
+remote:
+- `origin`: `https://github.com/okdmme/FastWAM-and-StarVLA.git`
+- `upstream`: `https://github.com/starVLA/starVLA.git`
+- `upstream` push URL は `DISABLED`
+
+この時点では push は行っていない。
+
+### 実行環境で確認するコマンド
+
+この作業環境では `torch` import ができないため、PyTorch が入った環境で以下を確認する。
+
+```bash
+cd /home/anpan/WM/starVLA
+python3 - <<'PY'
+from types import SimpleNamespace
+import torch
+from starVLA.model.modules.action_model.FastWAM_ActionDiT import get_action_model
+
+cfg = SimpleNamespace(framework=SimpleNamespace(action_model=SimpleNamespace(
+    action_dit_config={
+        "action_dim": 3,
+        "hidden_dim": 16,
+        "ffn_dim": 32,
+        "num_heads": 2,
+        "attn_head_dim": 4,
+        "num_layers": 1,
+        "text_dim": 8,
+        "freq_dim": 8,
+        "eps": 1e-6,
+        "use_gradient_checkpointing": False,
+    },
+    action_horizon=4,
+    num_inference_timesteps=2,
+    num_timestep_buckets=10,
+    noise_beta_alpha=1.5,
+    noise_beta_beta=1.0,
+    noise_s=0.999,
+)))
+model = get_action_model(cfg)
+vl = torch.randn(2, 5, 8)
+actions = torch.randn(2, 4, 3)
+loss = model(vl, actions)
+pred = model.predict_action(vl)
+print(type(model).__name__, tuple(loss.shape), tuple(pred.shape))
+PY
+```
+
+期待値:
+- `FastWAMActionDiTHead () (2, 4, 3)` のように表示される
+- loss は scalar tensor なので shape は `()`
+
 ### Step 3 でやること
 
 Step 2 で残した機能だけを、
