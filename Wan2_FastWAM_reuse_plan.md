@@ -363,6 +363,164 @@ FastWAM 由来で一時配置した `world_model` ファイル群のうち、
 `Wan2.py` の `build_inputs()` における timestep 構成を、
 FastWAM 的 first-frame 固定に寄せられるかを設計することです。
 
+## Step 2-1. `Wan2.py` の timestep 構成を FastWAM 的 first-frame 固定に寄せる設計
+
+確認ソース:
+- [Wan2.py:256](/home/anpan/WM/starVLA/starVLA/model/modules/world_model/Wan2.py:256)
+- [Wan2.py:282](/home/anpan/WM/starVLA/starVLA/model/modules/world_model/Wan2.py:282)
+- [FastWAM_WanVideoDiT.py:509](/home/anpan/WM/starVLA/starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py:509)
+
+### 現状の `Wan2.py`
+
+`Wan2.py` は `build_inputs()` で以下を行っている。
+
+1. `latents` の shape から `T, H, W` を得る
+2. `patch_size = (p_t, p_h, p_w)` を読む
+3. `seq_len = (T // p_t) * (H // p_h) * (W // p_w)` を計算する
+4. `timestep = zeros([B, seq_len])` を作る
+
+つまり現状は、全 token が同じ timestep 0 で固定されている。
+
+### FastWAM 側の前提
+
+`FastWAM_WanVideoDiT.py` は `pre_dit()` で:
+
+1. `tokens_per_frame = (H // p_h) * (W // p_w)` を計算する
+2. `token_timesteps` を `[B, num_latent_frames, tokens_per_frame]` で構成する
+3. `token_timesteps[:, 0, :] = 0` として first frame を clean に固定する
+4. 最後に `reshape(B, -1)` して token sequence に揃える
+
+ここで重要なのは token 順序で、FastWAM 側は
+
+```text
+(frame, h, w) -> flatten
+```
+
+すなわち frame-major の順で token を並べている。
+
+### `Wan2.py` でも同じ token 順序を仮定できる理由
+
+`Wan2.py` の `seq_len` 計算は
+
+```text
+(T // p_t) * (H // p_h) * (W // p_w)
+```
+
+となっており、Wan の patch 化後トークン列も
+時間軸を先頭に持つ frame-major flatten を前提にしているとみなすのが自然。
+
+この前提のもとでは、各 frame に属する token 数は
+
+```text
+tokens_per_frame = (H // p_h) * (W // p_w)
+num_temporal_groups = T // p_t
+```
+
+で定まる。
+
+### 変更案
+
+`Wan2.py` の `build_inputs()` で、現在の
+
+```python
+timestep = torch.zeros(batch_size, seq_len, device=device, dtype=torch.long)
+```
+
+を、次のような構成に変える。
+
+```text
+base_timestep: [B] または scalar 的な制御値
+token_timesteps: [B, num_temporal_groups, tokens_per_frame]
+token_timesteps[:, 0, :] = 0
+token_timesteps[:, 1:, :] = base_value
+flatten -> [B, seq_len]
+```
+
+### config として追加したい項目
+
+`wm_cfg` に次のような設定を追加する案が妥当。
+
+- `token_timestep_mode`
+  - `all_zero`
+  - `first_frame_zero`
+- `non_first_frame_timestep`
+  - 既定値は `0`
+  - 将来的に非ゼロも試せるようにする
+
+これにより:
+- 現行互換は `all_zero`
+- FastWAM 寄り挙動は `first_frame_zero`
+
+と切り替えられる。
+
+### この変更の利点
+
+- `WanTransformer3DModel` 自体は差し替えない
+- `Wan2.py` の wrapper だけで試せる
+- `FastWAM_WanVideoDiT.py` の全移植より影響範囲が小さい
+
+### 先に確認すべきこと
+
+この設計で実装する前に、次の確認が必要。
+
+1. `timestep` の dtype と期待レンジ
+   - 現在は `torch.long`
+   - 非ゼロ値を入れる場合、diffusers 側で問題なく受けられるか
+
+2. `T // p_t` が latent frame 数として常に妥当か
+   - Wan2.2 の patch size が `(1, 2, 2)` 前提なら問題は小さい
+   - ただし config 依存なので実装では一般式にする
+
+3. hidden-state 抽出用途への影響
+   - `all_zero` 前提で取っていた中間表現が変質しないか
+   - まずは `non_first_frame_timestep = 0` のままで API だけ追加するのが安全
+
+### Step 2-1 の実装方針
+
+最初の実装は最小限にする。
+
+1. `wm_cfg.token_timestep_mode` を読む
+2. デフォルトは現行互換 `all_zero`
+3. `first_frame_zero` のときだけ `token_timesteps` を frame 単位で組み立てる
+4. `non_first_frame_timestep` の既定値は `0` にして、挙動差を最初は出さない
+
+この形なら、まずは API と token grouping だけを安全に入れられる。
+
+### Step 2-1 の実装結果
+
+実装ファイル:
+- [Wan2.py](/home/anpan/WM/starVLA/starVLA/model/modules/world_model/Wan2.py:62)
+- [Wan2.py](/home/anpan/WM/starVLA/starVLA/model/modules/world_model/Wan2.py:260)
+
+追加した設定:
+- `wm_cfg.token_timestep_mode`
+  - 既定値: `all_zero`
+  - 対応値: `all_zero`, `first_frame_zero`
+- `wm_cfg.non_first_frame_timestep`
+  - 既定値: `0`
+
+追加した実装:
+- `_Wan2_Interface.__init__()` で timestep mode を読み込む
+- `_build_token_timesteps()` を追加
+- `build_inputs()` の timestep 生成を `_build_token_timesteps()` に切り出す
+
+現行互換:
+- config を追加しない場合は `all_zero` なので、既存と同じく全 token timestep は `0`
+
+FastWAM 寄り挙動:
+- `token_timestep_mode = first_frame_zero` のとき、
+  `[B, temporal_groups, tokens_per_frame]` で timestep を組み、
+  最初の temporal group の token を `0` に固定する
+- それ以外の temporal group は `non_first_frame_timestep` で埋める
+
+確認済み:
+- `python3 -m py_compile starVLA/model/modules/world_model/Wan2.py` は成功
+
+残る確認:
+- 実際の `diffusers.WanTransformer3DModel` 実行環境で、
+  `non_first_frame_timestep != 0` が期待どおり受けられるか
+- 現在の環境には `diffusers` が入っていないため、実 forward の確認は未実施
+
 ### Step 3 でやること
 
 Step 2 で残した機能だけを、

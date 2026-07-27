@@ -62,6 +62,13 @@ class _Wan2_Interface(nn.Module):
             config.framework.get("qwenvl", {}).get("base_vlm", "Wan-AI/Wan2.2-TI2V-5B-Diffusers"),
         )
         self.config = config
+        self.token_timestep_mode = wm_cfg.get("token_timestep_mode", "all_zero")
+        self.non_first_frame_timestep = int(wm_cfg.get("non_first_frame_timestep", 0))
+        if self.token_timestep_mode not in {"all_zero", "first_frame_zero"}:
+            raise ValueError(
+                "Unsupported Wan2 token_timestep_mode: "
+                f"{self.token_timestep_mode}. Expected 'all_zero' or 'first_frame_zero'."
+            )
 
         from diffusers import (
             AutoencoderKLWan,
@@ -253,6 +260,31 @@ class _Wan2_Interface(nn.Module):
 
         return latents
 
+    def _build_token_timesteps(self, batch_size, latents, device):
+        """Build per-token timesteps for Wan expand_timesteps mode."""
+        p_t, p_h, p_w = self.transformer.config.patch_size
+        _, _, T, H, W = latents.shape
+        num_temporal_groups = T // p_t
+        tokens_per_frame = (H // p_h) * (W // p_w)
+        seq_len = num_temporal_groups * tokens_per_frame
+        assert seq_len <= 1024, (
+            f"seq_len={seq_len} exceeds WanTransformer3D rope_max_seq_len=1024. "
+            f"Reduce num_frames or image resolution. "
+            f"(T_lat={T}, H_lat={H}, W_lat={W}, patch={p_t},{p_h},{p_w})"
+        )
+
+        if self.token_timestep_mode == "all_zero":
+            return torch.zeros(batch_size, seq_len, device=device, dtype=torch.long)
+
+        timestep = torch.full(
+            (batch_size, num_temporal_groups, tokens_per_frame),
+            self.non_first_frame_timestep,
+            device=device,
+            dtype=torch.long,
+        )
+        timestep[:, 0, :] = 0
+        return timestep.reshape(batch_size, seq_len)
+
     def build_inputs(self, images, instructions, **kwargs):
         """Build inputs for the Wan DiT world model.
 
@@ -276,18 +308,7 @@ class _Wan2_Interface(nn.Module):
         batch_size = latents.shape[0]
         device = latents.device
 
-        # Wan2.2 TI2V uses expand_timesteps: timestep is per-token
-        # Shape: [B, seq_len] where seq_len = T_lat * (H_lat//p_h) * (W_lat//p_w)
-        # For feature extraction at σ≈0, use zeros (clean input)
-        p_t, p_h, p_w = self.transformer.config.patch_size
-        _, _, T, H, W = latents.shape
-        seq_len = (T // p_t) * (H // p_h) * (W // p_w)
-        assert seq_len <= 1024, (
-            f"seq_len={seq_len} exceeds WanTransformer3D rope_max_seq_len=1024. "
-            f"Reduce num_frames or image resolution. "
-            f"(T_lat={T}, H_lat={H}, W_lat={W}, patch={p_t},{p_h},{p_w})"
-        )
-        timestep = torch.zeros(batch_size, seq_len, device=device, dtype=torch.long)
+        timestep = self._build_token_timesteps(batch_size, latents, device)
 
         return {
             "hidden_states": latents,
