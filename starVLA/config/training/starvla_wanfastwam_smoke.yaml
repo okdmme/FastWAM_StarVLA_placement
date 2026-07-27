@@ -1,0 +1,84 @@
+run_id: wanfastwam_smoke
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: llavavla
+is_debug: true
+
+framework:
+  name: WanFastWAM
+
+  world_model:
+    base_wm: ./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    extract_layers: [-1]
+    token_timestep_mode: first_frame_zero
+    non_first_frame_timestep: 1000
+
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    vl_hidden_dim: 4096
+
+  action_model:
+    action_model_type: FastWAMActionDiT
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+    future_action_window_size: 7
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    num_inference_timesteps: 4
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    action_dit_pretrained_path: null
+    skip_dit_load_from_pretrain: false
+    action_dit_config:
+      action_dim: 7
+      hidden_dim: 1024
+      ffn_dim: 4096
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      text_dim: 4096
+      freq_dim: 256
+      eps: 1.0e-06
+      use_gradient_checkpointing: false
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_goal
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}."
+    per_device_batch_size: 1
+    load_all_data_for_training: false
+    obs_image_size: [224, 224]
+
+trainer:
+  max_train_steps: 1
+  num_warmup_steps: 0
+  save_interval: 1
+  eval_interval: 1
+  learning_rate:
+    base: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 1
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt
