@@ -1256,6 +1256,37 @@ StarVLA 既存 module 配下に置くべき。
 - `python -m py_compile starVLA/model/framework/WM4A/FastWAM_MoT.py` 成功
 
 次に必要な作業:
-- `WanFastWAM.py` を `FastWAM_WanVideoDiT + FastWAM_ActionDiT + FastWAM_MoT` で構築する形へ置き換える
-- そのために `FastWAM.training_loss()` の StarVLA 版を `WanFastWAM.forward()` へ移植する
+- フル FastWAM 用の framework 入口を `starVLA/model/framework/WM4A/FastWAM.py` として新設する
+- `FastWAM.py` を `FastWAM_WanVideoDiT + FastWAM_ActionDiT + FastWAM_MoT` で構築する形へ実装する
+- そのために `FastWAM.training_loss()` の StarVLA 版を `FastWAMFramework.forward()` へ移植する
 - VAE/text encoder はまず既存 `Wan2.py` のものを再利用するか、FastWAM 公式 loader が必要かを判断する
+
+## Step 6. フル FastWAM framework 入口
+
+配置方針:
+- `starVLA/model/framework/WM4A/FastWAM.py`
+
+理由:
+- `WanFastWAM.py` は既存 `Wan2.py` hidden states と FastWAM ActionDiT を接続する初期 prototype として残す
+- 論文相当の FastWAM joint training は別 framework 名 `FastWAM` として扱う
+- StarVLA の framework auto-discovery は `WM4A/*.py` を自動 import するため、新規 folder は不要
+
+実装済み:
+- `FastWAMDefaultConfig`
+- `@FRAMEWORK_REGISTRY.register("FastWAM")`
+- `FastWAMFramework`
+- `FastWAM_WanVideoDiT`, `ActionDiT`, `MoT` の構築
+- MoT が要求する `num_heads`, `attn_head_dim`, `num_layers` の整合性チェック
+
+確認済み:
+- `python -m py_compile starVLA/model/framework/WM4A/FastWAM.py`
+- framework auto-discovery で `FastWAM_registered=True`
+
+未実装:
+- VAE / text encoder / tokenizer loading
+- StarVLA batch から FastWAM `sample` 形式への変換
+- `FastWAM.training_loss()` の `FastWAMFramework.forward()` への移植
+- `FastWAM.infer_action()` / `infer_joint()` の移植
+
+次の作業:
+- `FastWAM.training_loss()` を `FastWAM.py` に移植する前に、VAE/text encoder を既存 `Wan2.py` から再利用するか、FastWAM 公式 loader を配置するかを決める
