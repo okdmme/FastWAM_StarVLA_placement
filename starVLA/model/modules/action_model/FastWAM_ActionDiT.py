@@ -549,10 +549,9 @@ class FastWAMActionDiTHead(nn.Module):
         t_bc = t[:, None, None]
         noisy_actions = (1 - t_bc) * noise + t_bc * actions
         velocity = actions - noise
-        t_discretized = (t * self.num_timestep_buckets).long()
         pred_velocity = self.model(
             action_tokens=noisy_actions,
-            timestep=t_discretized,
+            timestep=t,
             context=context,
             context_mask=context_mask,
         )
@@ -576,9 +575,9 @@ class FastWAMActionDiTHead(nn.Module):
             t_cont = step / float(self.num_inference_timesteps)
             timestep = torch.full(
                 (context.shape[0],),
-                int(t_cont * self.num_timestep_buckets),
+                t_cont,
                 device=context.device,
-                dtype=torch.long,
+                dtype=context.dtype,
             )
             pred_velocity = self.model(
                 action_tokens=actions,

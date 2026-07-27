@@ -746,7 +746,18 @@ remote:
 
 ### 実行環境で確認するコマンド
 
-この作業環境では `torch` import ができないため、PyTorch が入った環境で以下を確認する。
+この作業環境では当初 `torch` import ができなかったため、Python 3.11 の検証用 venv を作って確認した。
+
+環境確認結果:
+- `nvidia-smi`: command not found
+- `lspci`: command not found
+- `nvcc`: command not found
+- `.venv-py311` の `torch.cuda.is_available()`: `False`
+- `.venv-py311` の `torch.__version__`: `2.6.0+cpu`
+
+この環境からは NVIDIA GPU / CUDA driver は見えていない。
+
+実行した検証:
 
 ```bash
 cd /home/anpan/WM/starVLA
@@ -784,9 +795,14 @@ print(type(model).__name__, tuple(loss.shape), tuple(pred.shape))
 PY
 ```
 
-期待値:
-- `FastWAMActionDiTHead () (2, 4, 3)` のように表示される
+確認結果:
+- `FastWAMActionDiTHead () (2, 4, 3) True`
 - loss は scalar tensor なので shape は `()`
+- predict output は `[2, 4, 3]`
+
+補足:
+- 最初の dummy test では wrapper が `ActionDiT` に discrete long timestep を渡しており dtype mismatch になった
+- `ActionDiT` は continuous float timestep を前提にしているため、wrapper 側を float timestep 渡しに修正した
 
 ### Step 3 でやること
 
