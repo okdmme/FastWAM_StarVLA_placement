@@ -1068,3 +1068,169 @@ FastWAM ActionDiT を action head として試す「最小統合」に寄って�
 2. diffusers `WanTransformer3DModel` を改造/subclass 化して MoT に必要な q/k/v 経路を開く
 
 新規フォルダを増やさない方針では、まず 1 を `Wan2.py` 内でどこまで可能か確認する。
+
+## Step 5. `Wan2.py` への FastWAM video expert 吸収可否
+
+方針:
+- まず StarVLA 既存 file へ吸収できるかを判断する
+- ただし役割を満たせない場合は、StarVLA の適切な既存 module 配下に FastWAM 公式ファイル相当を置く
+- 新しい folder は作らない
+
+### 確認対象
+
+- StarVLA:
+  - `starVLA/model/modules/world_model/Wan2.py`
+  - diffusers `WanTransformer3DModel`
+  - diffusers `WanTransformerBlock`
+
+- FastWAM:
+  - `src/fastwam/models/wan22/wan_video_dit.py`
+  - `src/fastwam/models/wan22/mot.py`
+
+### diffusers Wan の確認結果
+
+実行環境の diffusers:
+
+```text
+diffusers 0.39.0
+WanTransformer3DModel.forward(
+    hidden_states,
+    timestep,
+    encoder_hidden_states,
+    encoder_hidden_states_image=None,
+    return_dict=True,
+    attention_kwargs=None,
+)
+WanTransformerBlock.forward(
+    hidden_states,
+    encoder_hidden_states,
+    temb,
+    rotary_emb,
+)
+```
+
+`WanTransformer3DModel.forward()` は内部で以下を行う。
+
+1. `hidden_states` を `patch_embedding`
+2. timestep / text embedding を作る
+3. `for block in self.blocks: hidden_states = block(...)`
+4. `norm_out + proj_out`
+5. unpatchify して denoising output を返す
+
+`WanTransformerBlock.forward()` は self-attention を次のように内部完結させる。
+
+```python
+norm_hidden_states = ...
+attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+hidden_states = hidden_states + attn_output * gate_msa
+```
+
+ここでは:
+- self-attention mask は常に `None`
+- q/k/v は block 内部で作られる
+- MoT 側が q/k/v を concat して mixed attention する入口がない
+- block の post-attention/cross-attention/FFN 部分だけを再利用する公開 API もない
+
+`WanAttention.forward()` 自体は `attention_mask` を受け取るが、
+`WanTransformerBlock.forward()` が self-attention 呼び出し時に `None` を渡しているため、
+`Wan2.py` wrapper から video self-attention mask を自然に流せない。
+
+### FastWAM MoT が必要とする API
+
+FastWAM の `MoT` は各 layer で以下を行う。
+
+1. video expert block から q/k/v を作る
+2. action expert block から q/k/v を作る
+3. video/action q/k/v を concat
+4. mixed attention mask を使って attention
+5. attention output を expert ごとに split
+6. 各 expert の cross-attention / FFN / gate residual を適用
+
+このため、video expert は単なる `forward()` では足りず、最低限以下が必要。
+
+- `pre_dit()`
+- `post_dit()`
+- block ごとの q/k/v 構築に必要な module 構造
+- `build_video_to_video_mask()`
+- token-wise timestep modulation
+- action-conditioned context mask
+
+### 判断
+
+`Wan2.py` の既存 diffusers backend に FastWAM video expert を「吸収」するのは不適切。
+
+理由:
+- MoT の中核である q/k/v mixed-attention を diffusers `WanTransformer3DModel` の public wrapper から実現できない
+- `WanTransformerBlock.forward()` を大きく改造する必要がある
+- その改造は StarVLA 既存 `Wan2.py` の world-model feature-extraction wrapper と責務が大きく違う
+- `Wan2.py` に無理に埋め込むと、既存 `WanGR00T/WanPI/WanOFT` の backend と FastWAM 独自 backend が混在して保守しにくい
+
+したがって、ここは吸収ではなく、FastWAM 公式 `wan_video_dit.py` 相当を
+StarVLA 既存 module 配下に置くべき。
+
+### 配置判断
+
+新しい folder は作らず、既存 `world_model` module 直下に置く。
+
+推奨配置:
+
+- `starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py`
+
+理由:
+- 役割は明確に world model の video expert
+- `Wan2.py` は StarVLA 既存 diffusers Wan wrapper として残せる
+- FastWAM の `pre_dit/post_dit/build_video_to_video_mask` を公式実装に近い形で維持できる
+- MoT から video expert として直接使える
+- 新規 folder は増えない
+
+### 関連 helper の扱い
+
+`FastWAM_WanVideoDiT.py` は次を持つ。
+
+- `flash_attention`
+- `modulate`
+- `sinusoidal_embedding_1d`
+- `precompute_freqs_cis_3d`
+- `precompute_freqs_cis`
+- `rope_apply`
+- `DiTBlock`
+- `RMSNorm`
+- `SelfAttention`
+- `CrossAttention`
+
+これらは `FastWAM_ActionDiT.py` にも一部吸収済みで重複する。
+ただし、まずは FastWAM 公式構造を崩さず `FastWAM_WanVideoDiT.py` 側にも保持する。
+
+重複整理は後工程。
+
+理由:
+- 最初から共通化すると、公式 FastWAM との差分が増える
+- いまの目的は StarVLA 既存 module 配下で FastWAM を再現すること
+- 公式挙動の確認が済むまで helper 共通化はリスクが高い
+
+### `mot.py` の配置判断
+
+`mot.py` は world model そのものではなく、video/action experts を結合する framework-level orchestration。
+
+第一候補:
+- `starVLA/model/framework/WM4A/WanFastWAM.py` へ `MoT` class を吸収
+
+ただし、`MoT` が大きくなりすぎる場合は、既存 module 配下の追加 file として次を許容する。
+
+- `starVLA/model/framework/WM4A/FastWAM_MoT.py`
+
+判断基準:
+- `WanFastWAM.py` が読みにくくなるなら分離
+- ただし新規 folder は作らない
+
+### 次の実装ステップ
+
+1. `src/fastwam/models/wan22/wan_video_dit.py` を
+   `starVLA/model/modules/world_model/FastWAM_WanVideoDiT.py` として配置する
+2. import を StarVLA 向けに調整する
+   - `fastwam.utils.logging_config.get_logger` を `initialize_overwatch` に置換
+   - `.helpers.gradient` 依存を局所化または既存実装に置換
+3. `MoT` を `WanFastWAM.py` 内へ吸収できるか試す
+4. 難しければ `framework/WM4A/FastWAM_MoT.py` として配置する
+5. `WanFastWAM.py` を `Wan2 hidden states -> ActionDiT` ではなく、
+   `FastWAM_WanVideoDiT + FastWAM_ActionDiT + MoT` の構成へ置き換える
