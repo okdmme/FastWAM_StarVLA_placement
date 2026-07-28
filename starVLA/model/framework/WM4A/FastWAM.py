@@ -193,6 +193,17 @@ class FastWAMDefaultConfig:
         }
     )
 
+    encoder: dict = field(
+        default_factory=lambda: {
+            "load_wan2_encoders": False,
+            "base_wm": "./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            "text_max_length": 512,
+            "height": 480,
+            "width": 832,
+            "num_frames": None,
+        }
+    )
+
 
 @FRAMEWORK_REGISTRY.register("FastWAM")
 class FastWAMFramework(baseframework):
@@ -209,9 +220,16 @@ class FastWAMFramework(baseframework):
         self.infer_video_scheduler: WanContinuousFlowMatchScheduler | None = None
         self.train_action_scheduler: WanContinuousFlowMatchScheduler | None = None
         self.infer_action_scheduler: WanContinuousFlowMatchScheduler | None = None
+        self.tokenizer = None
+        self.text_encoder = None
+        self.vae = None
+        self.video_processor = None
 
         self._build_experts()
         self._build_schedulers()
+        encoder_cfg = self.config.framework.encoder
+        if bool(encoder_cfg.get("load_wan2_encoders", False)):
+            self._ensure_wan2_encoders()
 
     def _build_experts(self) -> None:
         """Build FastWAM experts from StarVLA config.
@@ -283,22 +301,30 @@ class FastWAMFramework(baseframework):
         param = next(self.parameters())
         return param.device, param.dtype
 
-    def _examples_to_precomputed_sample(self, examples: list[dict]) -> dict[str, Any]:
+    def _examples_to_sample(self, examples: list[dict]) -> dict[str, Any]:
         if not examples:
             raise ValueError("FastWAM forward received an empty examples list.")
-        if "input_latents" not in examples[0] and "latents" not in examples[0]:
+        if "input_latents" in examples[0] or "latents" in examples[0]:
+            latents_key = "input_latents" if "input_latents" in examples[0] else "latents"
+            sample = {
+                "input_latents": torch.stack([torch.as_tensor(example[latents_key]) for example in examples], dim=0),
+                "context": torch.stack([torch.as_tensor(example["context"]) for example in examples], dim=0),
+                "context_mask": torch.stack([torch.as_tensor(example["context_mask"]) for example in examples], dim=0),
+                "action": torch.stack([torch.as_tensor(example["action"]) for example in examples], dim=0),
+            }
+        elif "image" in examples[0] or "video" in examples[0]:
+            image_key = "video" if "video" in examples[0] else "image"
+            sample = {
+                "images": [example[image_key] for example in examples],
+                "prompt": [example.get("lang", example.get("prompt", "")) for example in examples],
+                "action": torch.stack([torch.as_tensor(example["action"]) for example in examples], dim=0),
+            }
+        else:
             raise ValueError(
-                "FastWAM full training currently requires precomputed `input_latents` in examples. "
-                "Image/video-to-latent adapter is the next integration step."
+                "FastWAM forward requires either precomputed `input_latents/context/context_mask` "
+                "or raw `image`/`video` plus `lang`/`prompt` examples."
             )
 
-        latents_key = "input_latents" if "input_latents" in examples[0] else "latents"
-        sample = {
-            "input_latents": torch.stack([torch.as_tensor(example[latents_key]) for example in examples], dim=0),
-            "context": torch.stack([torch.as_tensor(example["context"]) for example in examples], dim=0),
-            "context_mask": torch.stack([torch.as_tensor(example["context_mask"]) for example in examples], dim=0),
-            "action": torch.stack([torch.as_tensor(example["action"]) for example in examples], dim=0),
-        }
         for optional_key in ("first_frame_latents", "action_is_pad", "image_is_pad"):
             if optional_key in examples[0] and examples[0][optional_key] is not None:
                 sample[optional_key] = torch.stack(
@@ -307,20 +333,146 @@ class FastWAMFramework(baseframework):
                 )
         return sample
 
+    def _ensure_wan2_encoders(self) -> None:
+        if self.vae is not None and self.text_encoder is not None and self.tokenizer is not None:
+            return
+
+        encoder_cfg = self.config.framework.encoder
+        if not bool(encoder_cfg.get("load_wan2_encoders", False)):
+            raise ValueError(
+                "Raw image/video FastWAM training requires Wan2 encoder loading. "
+                "Set `framework.encoder.load_wan2_encoders=true`, or provide precomputed "
+                "`input_latents/context/context_mask`."
+            )
+
+        model_name = encoder_cfg.get("base_wm", None) or self.config.framework.world_model.get("base_wm")
+        device, dtype = self._model_device_dtype()
+
+        from diffusers import AutoencoderKLWan
+        from diffusers.video_processor import VideoProcessor
+        from transformers import T5TokenizerFast, UMT5EncoderModel
+
+        logger.info("Loading Wan2 VAE/text encoders for FastWAM adapter from %s", model_name)
+        self.tokenizer = T5TokenizerFast.from_pretrained(model_name, subfolder="tokenizer")
+        self.text_encoder = UMT5EncoderModel.from_pretrained(
+            model_name,
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+        ).to(device=device)
+        self.vae = AutoencoderKLWan.from_pretrained(
+            model_name,
+            subfolder="vae",
+            torch_dtype=dtype,
+        ).to(device=device)
+        self.text_encoder.requires_grad_(False)
+        self.vae.requires_grad_(False)
+
+        vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample)
+        self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor_spatial)
+
+    @torch.no_grad()
+    def _encode_text_context(self, prompt: str | list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_wan2_encoders()
+        device, dtype = self._model_device_dtype()
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=int(self.config.framework.encoder.get("text_max_length", 512)),
+            truncation=True,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        ).to(device)
+        text_embeds = self.text_encoder(
+            input_ids=text_inputs.input_ids,
+            attention_mask=text_inputs.attention_mask,
+        ).last_hidden_state
+        seq_lens = text_inputs.attention_mask.gt(0).sum(dim=1).long()
+        for i, seq_len in enumerate(seq_lens):
+            text_embeds[i, seq_len:] = 0
+        context_mask = torch.ones_like(text_inputs.attention_mask, dtype=torch.bool)
+        return text_embeds.to(device=device, dtype=dtype), context_mask.to(device=device)
+
+    @torch.no_grad()
+    def _encode_images_to_latents(self, images: list[Any]) -> torch.Tensor:
+        self._ensure_wan2_encoders()
+        device, dtype = self._model_device_dtype()
+        encoder_cfg = self.config.framework.encoder
+        height = int(encoder_cfg.get("height", 480))
+        width = int(encoder_cfg.get("width", 832))
+        num_frames = encoder_cfg.get("num_frames", None)
+        target_frames = None if num_frames is None else int(num_frames)
+
+        preprocessed = []
+        frame_counts = []
+        for sample_images in images:
+            if not isinstance(sample_images, (list, tuple)):
+                sample_images = [sample_images]
+            video_tensor = self.video_processor.preprocess_video(sample_images, height=height, width=width)
+            video_tensor = video_tensor.to(device=device, dtype=dtype)
+            preprocessed.append(video_tensor)
+            frame_counts.append(video_tensor.shape[2])
+
+        target_frames = target_frames if target_frames is not None else max(frame_counts)
+        batch_videos = []
+        for video_tensor in preprocessed:
+            frame_count = video_tensor.shape[2]
+            if frame_count > target_frames:
+                video_tensor = video_tensor[:, :, :target_frames]
+            elif frame_count < target_frames:
+                last_frame = video_tensor[:, :, -1:]
+                padding = last_frame.repeat(1, 1, target_frames - frame_count, 1, 1)
+                video_tensor = torch.cat([video_tensor, padding], dim=2)
+            batch_videos.append(video_tensor.squeeze(0))
+
+        video = torch.stack(batch_videos, dim=0)
+        latents = self.vae.encode(video).latent_dist.sample()
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            1.0
+            / torch.tensor(self.vae.config.latents_std)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        return (latents - latents_mean) * latents_std
+
+    def _build_raw_video_inputs(self, sample: dict[str, Any]) -> dict[str, Any]:
+        images = sample.get("images", sample.get("video", sample.get("image")))
+        prompt = sample.get("prompt", sample.get("lang", ""))
+        if images is None:
+            raise ValueError("Raw FastWAM adapter requires `images`, `video`, or `image`.")
+        input_latents = self._encode_images_to_latents(images)
+        context, context_mask = self._encode_text_context(prompt)
+
+        converted = dict(sample)
+        converted.pop("images", None)
+        converted.pop("video", None)
+        converted.pop("image", None)
+        converted.pop("prompt", None)
+        converted.pop("lang", None)
+        converted["input_latents"] = input_latents
+        converted["context"] = context
+        converted["context_mask"] = context_mask
+        return converted
+
     def build_inputs(self, sample: dict[str, Any] | list[dict], tiled: bool = False) -> dict[str, Any]:
         del tiled
         if isinstance(sample, list):
-            sample = self._examples_to_precomputed_sample(sample)
+            sample = self._examples_to_sample(sample)
         if not isinstance(sample, dict):
             raise TypeError(f"FastWAM forward expects a dict or list[dict], got {type(sample)!r}.")
 
         if "input_latents" not in sample:
-            if "video" in sample:
-                raise NotImplementedError(
-                    "FastWAM image/video-to-latent training adapter is not ported yet. "
-                    "Provide precomputed `input_latents`, `context`, `context_mask`, and `action`."
-                )
-            raise ValueError("FastWAM training requires `input_latents`.")
+            if any(key in sample for key in ("images", "video", "image")):
+                sample = self._build_raw_video_inputs(sample)
+            else:
+                raise ValueError("FastWAM training requires `input_latents`.")
         for key in ("context", "context_mask", "action"):
             if key not in sample:
                 raise ValueError(f"FastWAM training requires `{key}`.")

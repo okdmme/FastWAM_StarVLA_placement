@@ -195,6 +195,38 @@ class FastWAMSmokeTest(unittest.TestCase):
         self.assertEqual(out["action_loss"].ndim, 0)
         self.assertTrue(torch.isfinite(out["action_loss"]))
 
+    def test_raw_examples_route_through_encoder_adapter(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg())
+        model.train()
+
+        model._encode_images_to_latents = lambda images: torch.randn(2, 4, 2, 2, 2)
+        model._encode_text_context = lambda prompt: (
+            torch.randn(2, 5, 6),
+            torch.ones(2, 5, dtype=torch.bool),
+        )
+        examples = [
+            {"image": ["frame0", "frame1"], "lang": "pick", "action": torch.randn(1, 3)},
+            {"image": ["frame0", "frame1"], "lang": "place", "action": torch.randn(1, 3)},
+        ]
+
+        out = model(examples)
+
+        self.assertIn("action_loss", out)
+        self.assertEqual(out["action_loss"].ndim, 0)
+        self.assertTrue(torch.isfinite(out["action_loss"]))
+
+    def test_raw_examples_require_encoder_loading_or_precomputed_latents(self):
+        model = build_framework(_tiny_fastwam_cfg())
+
+        with self.assertRaisesRegex(ValueError, "load_wan2_encoders=true"):
+            model(
+                [
+                    {"image": ["frame0", "frame1"], "lang": "pick", "action": torch.randn(1, 3)},
+                    {"image": ["frame0", "frame1"], "lang": "place", "action": torch.randn(1, 3)},
+                ]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
