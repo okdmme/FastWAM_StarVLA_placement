@@ -1,10 +1,16 @@
 import unittest
+import os
+from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
 
 from starVLA.model.framework.WM4A.FastWAM import WanContinuousFlowMatchScheduler
 from starVLA.model.framework.base_framework import build_framework
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_ENCODER_SMOKE_CONFIG = _REPO_ROOT / "starVLA/config/training/starvla_fastwam_encoder_smoke.yaml"
 
 
 def _tiny_fastwam_cfg():
@@ -226,6 +232,36 @@ class FastWAMSmokeTest(unittest.TestCase):
                     {"image": ["frame0", "frame1"], "lang": "place", "action": torch.randn(1, 3)},
                 ]
             )
+
+    def test_encoder_smoke_config_is_wired_for_fastwam(self):
+        cfg = OmegaConf.load(_ENCODER_SMOKE_CONFIG)
+
+        self.assertEqual(cfg.framework.name, "FastWAM")
+        self.assertTrue(cfg.framework.encoder.load_wan2_encoders)
+        self.assertEqual(cfg.framework.encoder.height, 64)
+        self.assertEqual(cfg.framework.encoder.width, 64)
+        self.assertEqual(cfg.framework.encoder.num_frames, 5)
+        self.assertEqual(cfg.framework.world_model.video_dit_config.in_dim, 48)
+        self.assertEqual(cfg.framework.world_model.video_dit_config.text_dim, 4096)
+        self.assertEqual(cfg.framework.action_model.action_dit_config.text_dim, 4096)
+
+    def test_optional_wan2_encoder_load_smoke(self):
+        if os.environ.get("FASTWAM_RUN_ENCODER_SMOKE") != "1":
+            self.skipTest("Set FASTWAM_RUN_ENCODER_SMOKE=1 to load real Wan2 VAE/text encoders.")
+
+        cfg = OmegaConf.load(_ENCODER_SMOKE_CONFIG)
+        model_path = os.environ.get("FASTWAM_ENCODER_MODEL_PATH", cfg.framework.encoder.base_wm)
+        model_path = str((_REPO_ROOT / model_path).resolve()) if not os.path.isabs(model_path) else model_path
+        if not os.path.isdir(model_path):
+            self.skipTest(f"Wan2 diffusers model path does not exist: {model_path}")
+
+        cfg.framework.encoder.base_wm = model_path
+        cfg.framework.world_model.base_wm = model_path
+        model = build_framework(cfg)
+
+        self.assertIsNotNone(model.vae)
+        self.assertIsNotNone(model.text_encoder)
+        self.assertIsNotNone(model.tokenizer)
 
 
 if __name__ == "__main__":

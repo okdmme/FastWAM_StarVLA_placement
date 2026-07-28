@@ -52,7 +52,8 @@ FastWAM を StarVLA 上で論文設定に近い形でフルスクラッチ学習
 - `FastWAM_WanVideoDiT.py`: 配置済み。StarVLA logger/import/checkpoint helper に合わせた最小変更のみ。
 - `FastWAM_MoT.py`: 配置済み。StarVLA の module import に合わせた最小変更のみ。
 - `FastWAM.py`: registry entry、expert 構築、MoT 接続、scheduler 吸収、precomputed latent training loss、Wan2 diffusers encoder adapter 入口まで完了。
-- `tests/test_fastwam_smoke.py`: 追加済み。tiny config で scheduler、framework build、video/action expert と MoT の token-level forward、precomputed latent forward/backward、raw examples adapter routing を確認する。
+- `starVLA/config/training/starvla_fastwam_encoder_smoke.yaml`: 追加済み。Wan2 VAE/text encoder を実ロードするための小型 FastWAM smoke config。
+- `tests/test_fastwam_smoke.py`: 追加済み。tiny config で scheduler、framework build、video/action expert と MoT の token-level forward、precomputed latent forward/backward、raw examples adapter routing、encoder smoke config 配線を確認する。
 
 ## Smoke Test Scope
 
@@ -66,8 +67,10 @@ FastWAM を StarVLA 上で論文設定に近い形でフルスクラッチ学習
 - StarVLA trainer 互換の `compute_loss("vla", batch)` 経由でも `action_loss` を返せるか。
 - StarVLA examples 形式の raw `image`/`video` + `lang` が encoder adapter を通って loss 経路に入るか。
 - `framework.encoder.load_wan2_encoders=false` のまま raw examples が来た場合、precomputed latent が必要だと明確に失敗するか。
+- `framework.encoder.load_wan2_encoders=true` の smoke config が `FastWAM`、Wan2 latent dim `48`、text dim `4096` に揃っているか。
 
-この段階では実物の VAE/text encoder ロードと実 dataloader batch はまだ確認対象外。
+この段階では実 dataloader batch はまだ確認対象外。
+実物の VAE/text encoder ロードは optional test として追加済みだが、現在のローカル環境には Wan2 diffusers モデル実体が見つからないため通常テストでは skip する。
 
 ## Training Loss Integration
 
@@ -102,6 +105,6 @@ FastWAM の `training_loss()` では transformer は `FastWAM_WanVideoDiT.py` �
 ## Next Work
 
 1. 実際の StarVLA dataloader examples で raw adapter を小さい batch から確認する。
-2. `framework.encoder.load_wan2_encoders=true` 用の smoke config を追加する。
+2. Wan2 diffusers モデル実体のローカルパスを用意し、`FASTWAM_RUN_ENCODER_SMOKE=1` で optional encoder load test を実行する。
 3. 公式重み形式のロードが必要になった場合だけ、公式 FastWAM の loader/helper を既存 module 配下へ最小配置する。
 4. `predict_action()` 側に `infer_action()` を移植する。

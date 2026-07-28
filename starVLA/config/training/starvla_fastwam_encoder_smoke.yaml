@@ -1,0 +1,108 @@
+run_id: fastwam_encoder_smoke
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: llavavla
+is_debug: true
+
+framework:
+  name: FastWAM
+
+  world_model:
+    base_wm: ./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    video_dit_config:
+      hidden_dim: 16
+      in_dim: 48
+      ffn_dim: 64
+      out_dim: 48
+      text_dim: 4096
+      freq_dim: 16
+      eps: 1.0e-06
+      patch_size: [1, 2, 2]
+      num_heads: 2
+      attn_head_dim: 4
+      num_layers: 1
+      has_image_input: false
+      seperated_timestep: true
+      fuse_vae_embedding_in_latents: true
+      action_conditioned: true
+      action_dim: 7
+      video_attention_mask_mode: bidirectional
+      use_gradient_checkpointing: false
+
+  action_model:
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 1
+    action_dit_config:
+      action_dim: 7
+      hidden_dim: 16
+      ffn_dim: 64
+      num_heads: 2
+      attn_head_dim: 4
+      num_layers: 1
+      text_dim: 4096
+      freq_dim: 16
+      eps: 1.0e-06
+      use_gradient_checkpointing: false
+
+  mot:
+    mot_checkpoint_mixed_attn: false
+
+  scheduler:
+    video_train_shift: 5.0
+    video_infer_shift: 5.0
+    video_num_train_timesteps: 1000
+    action_train_shift: 5.0
+    action_infer_shift: 5.0
+    action_num_train_timesteps: 1000
+
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+
+  encoder:
+    load_wan2_encoders: true
+    base_wm: ./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    text_max_length: 512
+    height: 64
+    width: 64
+    num_frames: 5
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_goal
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}."
+    per_device_batch_size: 1
+    load_all_data_for_training: false
+    obs_image_size: [64, 64]
+
+trainer:
+  max_train_steps: 1
+  num_warmup_steps: 0
+  save_interval: 1
+  eval_interval: 1
+  learning_rate:
+    base: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 1
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt
