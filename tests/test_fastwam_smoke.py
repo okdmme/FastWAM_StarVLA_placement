@@ -13,7 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ENCODER_SMOKE_CONFIG = _REPO_ROOT / "starVLA/config/training/starvla_fastwam_encoder_smoke.yaml"
 
 
-def _tiny_fastwam_cfg():
+def _tiny_fastwam_cfg(video_attention_mask_mode="bidirectional"):
     hidden_dim = 8
     text_dim = 6
     action_dim = 3
@@ -39,7 +39,7 @@ def _tiny_fastwam_cfg():
                         "fuse_vae_embedding_in_latents": True,
                         "action_conditioned": True,
                         "action_dim": action_dim,
-                        "video_attention_mask_mode": "bidirectional",
+                        "video_attention_mask_mode": video_attention_mask_mode,
                         "use_gradient_checkpointing": False,
                     },
                 },
@@ -262,6 +262,40 @@ class FastWAMSmokeTest(unittest.TestCase):
         self.assertIsNotNone(model.vae)
         self.assertIsNotNone(model.text_encoder)
         self.assertIsNotNone(model.tokenizer)
+
+    def test_predict_action_returns_normalized_actions_for_precomputed_inputs(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg(video_attention_mask_mode="first_frame_causal"))
+        examples = [
+            {
+                "first_frame_latents": torch.randn(4, 1, 2, 2),
+                "context": torch.randn(5, 6),
+                "context_mask": torch.ones(5, dtype=torch.bool),
+            },
+            {
+                "first_frame_latents": torch.randn(4, 1, 2, 2),
+                "context": torch.randn(5, 6),
+                "context_mask": torch.ones(5, dtype=torch.bool),
+            },
+        ]
+
+        out = model.predict_action(examples, action_horizon=1, num_inference_steps=2, seed=0)
+
+        self.assertIn("normalized_actions", out)
+        self.assertEqual(out["normalized_actions"].shape, (2, 1, 3))
+
+    def test_predict_action_requires_first_frame_causal_mode(self):
+        model = build_framework(_tiny_fastwam_cfg())
+        examples = [
+            {
+                "first_frame_latents": torch.randn(4, 1, 2, 2),
+                "context": torch.randn(5, 6),
+                "context_mask": torch.ones(5, dtype=torch.bool),
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "first_frame_causal"):
+            model.predict_action(examples, action_horizon=1, num_inference_steps=1)
 
 
 if __name__ == "__main__":

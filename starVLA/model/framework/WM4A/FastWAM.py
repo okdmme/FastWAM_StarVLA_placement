@@ -15,6 +15,7 @@ landing point for the paper-style FastWAM joint video/action training path.
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -691,8 +692,224 @@ class FastWAMFramework(baseframework):
         loss, loss_dict = self.training_loss(examples, tiled=bool(kwargs.get("tiled", False)))
         return {"action_loss": loss, **loss_dict}
 
+    @torch.no_grad()
+    def _predict_action_noise_with_cache(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+
+    def _examples_to_prediction_sample(self, examples: list[dict]) -> dict[str, Any]:
+        if not examples:
+            raise ValueError("FastWAM predict_action received an empty examples list.")
+        if "first_frame_latents" in examples[0]:
+            return {
+                "first_frame_latents": torch.stack(
+                    [torch.as_tensor(example["first_frame_latents"]) for example in examples],
+                    dim=0,
+                ),
+                "context": torch.stack([torch.as_tensor(example["context"]) for example in examples], dim=0),
+                "context_mask": torch.stack([torch.as_tensor(example["context_mask"]) for example in examples], dim=0),
+            }
+        if "input_latents" in examples[0] or "latents" in examples[0]:
+            latents_key = "input_latents" if "input_latents" in examples[0] else "latents"
+            return {
+                "first_frame_latents": torch.stack(
+                    [torch.as_tensor(example[latents_key])[:, 0:1] for example in examples],
+                    dim=0,
+                ),
+                "context": torch.stack([torch.as_tensor(example["context"]) for example in examples], dim=0),
+                "context_mask": torch.stack([torch.as_tensor(example["context_mask"]) for example in examples], dim=0),
+            }
+        if "image" in examples[0] or "video" in examples[0]:
+            image_key = "video" if "video" in examples[0] else "image"
+            raw_images = []
+            for example in examples:
+                sample_images = example[image_key]
+                if isinstance(sample_images, (list, tuple)):
+                    raw_images.append([sample_images[0]])
+                else:
+                    raw_images.append([sample_images])
+            first_frame_latents = self._encode_images_to_latents(raw_images)
+            context, context_mask = self._encode_text_context(
+                [example.get("lang", example.get("prompt", "")) for example in examples]
+            )
+            return {
+                "first_frame_latents": first_frame_latents,
+                "context": context,
+                "context_mask": context_mask,
+            }
+        raise ValueError(
+            "FastWAM predict_action requires `first_frame_latents/context/context_mask`, "
+            "`input_latents/context/context_mask`, or raw `image`/`video` plus `lang`/`prompt`."
+        )
+
+    def _build_predict_inputs(self, examples) -> dict[str, torch.Tensor]:
+        if isinstance(examples, list):
+            sample = self._examples_to_prediction_sample(examples)
+        elif isinstance(examples, dict):
+            sample = dict(examples)
+            if "first_frame_latents" not in sample:
+                if "input_latents" in sample:
+                    sample["first_frame_latents"] = sample["input_latents"][:, :, 0:1]
+                elif any(key in sample for key in ("images", "image", "video")):
+                    raw_inputs = self._build_raw_video_inputs(sample)
+                    sample["first_frame_latents"] = raw_inputs["input_latents"][:, :, 0:1]
+                    sample["context"] = raw_inputs["context"]
+                    sample["context_mask"] = raw_inputs["context_mask"]
+                else:
+                    raise ValueError("FastWAM predict_action requires `first_frame_latents` or raw image/video input.")
+        else:
+            raise TypeError(f"FastWAM predict_action expects dict or list[dict], got {type(examples)!r}.")
+
+        for key in ("first_frame_latents", "context", "context_mask"):
+            if key not in sample:
+                raise ValueError(f"FastWAM predict_action requires `{key}`.")
+
+        device, dtype = self._model_device_dtype()
+        first_frame_latents = self._as_tensor(sample["first_frame_latents"], device=device, dtype=dtype)
+        context = self._as_tensor(sample["context"], device=device, dtype=dtype)
+        context_mask = self._as_tensor(sample["context_mask"], device=device, dtype=torch.bool)
+        if first_frame_latents.ndim != 5:
+            raise ValueError(
+                "`first_frame_latents` must be 5D [B,C,1,H,W] or [B,C,T,H,W], "
+                f"got {tuple(first_frame_latents.shape)}."
+            )
+        first_frame_latents = first_frame_latents[:, :, 0:1]
+        if context.ndim != 3 or context_mask.ndim != 2:
+            raise ValueError(
+                f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+            )
+        if context.shape[0] != first_frame_latents.shape[0] or context_mask.shape[0] != first_frame_latents.shape[0]:
+            raise ValueError("Predict input batch dimensions must match.")
+        return {
+            "first_frame_latents": first_frame_latents,
+            "context": context,
+            "context_mask": context_mask,
+        }
+
+    @torch.no_grad()
+    def infer_action(
+        self,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        action_horizon: int,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+    ) -> torch.Tensor:
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError("FastWAM action inference requires `video_attention_mask_mode='first_frame_causal'`.")
+        if action_horizon <= 0:
+            raise ValueError(f"`action_horizon` must be positive, got {action_horizon}.")
+
+        batch_size = int(first_frame_latents.shape[0])
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (batch_size, int(action_horizon), self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=first_frame_latents.device, dtype=first_frame_latents.dtype)
+
+        timestep_video = torch.zeros(
+            (batch_size,),
+            dtype=first_frame_latents.dtype,
+            device=first_frame_latents.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)),
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=int(num_inference_steps),
+            device=first_frame_latents.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.expand(batch_size).to(
+                dtype=latents_action.dtype,
+                device=latents_action.device,
+            )
+            pred_action = self._predict_action_noise_with_cache(
+                latents_action=latents_action,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+        return latents_action.detach().to(device="cpu", dtype=torch.float32)
+
     @torch.inference_mode()
     def predict_action(self, examples, **kwargs):
-        raise NotImplementedError(
-            "FastWAM predict_action is not ported yet. Next step: port FastWAM.infer_action()."
+        predict_inputs = self._build_predict_inputs(examples)
+        action_horizon = int(
+            kwargs.get(
+                "action_horizon",
+                self.config.framework.action_model.get("action_horizon", 1),
+            )
         )
+        actions = self.infer_action(
+            first_frame_latents=predict_inputs["first_frame_latents"],
+            context=predict_inputs["context"],
+            context_mask=predict_inputs["context_mask"],
+            action_horizon=action_horizon,
+            num_inference_steps=int(kwargs.get("num_inference_steps", kwargs.get("num_ddim_steps", 20))),
+            sigma_shift=kwargs.get("sigma_shift", None),
+            seed=kwargs.get("seed", None),
+            rand_device=kwargs.get("rand_device", "cpu"),
+        )
+        return {"normalized_actions": np.asarray(actions)}
