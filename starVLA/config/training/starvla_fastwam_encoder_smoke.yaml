@@ -69,6 +69,10 @@ framework:
     width: 64
     num_frames: 5
 
+  checkpoint:
+    path:
+    strict: false
+
 datasets:
   vla_data:
     dataset_py: lerobot_datasets

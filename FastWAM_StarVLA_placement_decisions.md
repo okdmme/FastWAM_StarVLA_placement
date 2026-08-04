@@ -309,5 +309,30 @@ action-only 推論では、video を毎 step 生成するのではなく、first
 
 1. 実際の StarVLA dataloader examples で raw adapter を小さい batch から確認する。
 2. Wan2 diffusers モデル実体のローカルパスを用意し、`FASTWAM_RUN_ENCODER_SMOKE=1` で optional encoder load test を実行する。
-3. raw image から `predict_action()` までの実物 encoder smoke を実行する。
-4. 公式重み形式のロードが必要になった場合だけ、公式 FastWAM の loader/helper を既存 module 配下へ最小配置する。
+3. 公式 FastWAM checkpoint と dataset stats を `checkpoints/fastwam_release/` へ置く。
+4. 公式 checkpoint を StarVLA FastWAM へロードし、shape/key対応を確認する。
+5. 公式 checkpoint に含まれる `proprio_encoder` を StarVLA側へ吸収し、state/proprioをcontextへ追加する経路を実装する。
+6. raw image・language・proprio/state から `predict_action()` までの実物 encoder smoke を実行する。
+7. StarVLA dataloader の実 batch で `training_loss()` を確認する。
+8. FastWAM をフルスクラッチ学習する。
+
+2026-08-02更新:
+
+- 公式READMEのcheckpoint 4ファイルは、StarVLAローカルの `checkpoints/fastwam_release/` に配置済み。
+- `checkpoints/` は `.gitignore` に追加済み。合計約23GBの外部成果物であり、gitには入れない。
+- `libero_uncond_2cam224.pt` は `mot` 1649 keys、`action_dim=7`、`proprio_dim=8`。
+- `robotwin_uncond_3cam_384.pt` は `mot` 1649 keys、`action_dim=14`、`proprio_dim=14`。
+- 両checkpointとも top-level keys は `mot`, `proprio_encoder`, `step`, `torch_dtype`。
+- StarVLA側の `load_checkpoint()` は `payload["mot"]` に対応済みだが、現状は `proprio_encoder` を無視する。そのため公式checkpointを使った意味のあるAction推論には、公式 `FastWAM._append_proprio_to_context()` 相当のproprio経路をStarVLA側へ吸収する必要がある。
+
+2026-08-04更新:
+
+- StarVLA側へ `proprio_encoder` を実装済み。
+- `framework.action_model.proprio_dim` を追加した。通常は `None` で無効。
+- 公式checkpointに `proprio_encoder` が含まれる場合は、checkpointのweight shapeから `proprio_dim` を自動判定して `nn.Linear(proprio_dim, text_dim)` を構築する。
+- `payload["mot"]` に加えて `payload["proprio_encoder"]` をロードする。
+- trainingでは `sample["proprio"]` または `sample["state"]` を受け取り、公式実装と同じくcontext末尾へ1トークン追加する。
+- `predict_action()` でも `proprio` または `state` を受け取り、context末尾へ1トークン追加する。
+- ABCIで公式checkpointを確認するため、`starvla_fastwam_libero_official_infer.yaml` と `starvla_fastwam_robotwin_official_infer.yaml` を追加した。
+- `tests.test_fastwam_smoke` は17件通過。proprioのcontext追加とcheckpointロードを小型構成で確認済み。
+- 次の未完了点は、ABCI上で公式サイズのモデルを構築して実checkpointをロードし、shape mismatchが残っていないかを確認すること。

@@ -697,6 +697,7 @@ class FastWAMDefaultConfig:
         default_factory=lambda: {
             "action_dim": 7,
             "state_dim": 7,
+            "proprio_dim": None,
             "action_horizon": 8,
             "action_dit_config": {
                 "action_dim": 7,
@@ -749,6 +750,13 @@ class FastWAMDefaultConfig:
         }
     )
 
+    checkpoint: dict = field(
+        default_factory=lambda: {
+            "path": None,
+            "strict": False,
+        }
+    )
+
 
 @FRAMEWORK_REGISTRY.register("FastWAM")
 class FastWAMFramework(baseframework):
@@ -769,9 +777,19 @@ class FastWAMFramework(baseframework):
         self.text_encoder = None
         self.vae = None
         self.video_processor = None
+        self.loaded_checkpoint = None
+        self.proprio_dim = None
+        self.proprio_encoder = None
 
         self._build_experts()
         self._build_schedulers()
+        checkpoint_cfg = self.config.framework.checkpoint
+        checkpoint_path = checkpoint_cfg.get("path", None)
+        if checkpoint_path:
+            self.load_checkpoint(
+                checkpoint_path,
+                strict=bool(checkpoint_cfg.get("strict", False)),
+            )
         encoder_cfg = self.config.framework.encoder
         if bool(encoder_cfg.get("load_wan2_encoders", False)):
             self._ensure_wan2_encoders()
@@ -794,6 +812,7 @@ class FastWAMFramework(baseframework):
 
         self.video_expert = WanVideoDiT(**video_dit_config)
         self.action_expert = ActionDiT(**action_dit_config)
+        self._build_proprio_encoder(action_cfg.get("proprio_dim", None))
 
         if int(self.action_expert.num_heads) != int(self.video_expert.num_heads):
             raise ValueError("ActionDiT `num_heads` must match video expert for FastWAM MoT.")
@@ -807,6 +826,20 @@ class FastWAMFramework(baseframework):
             mot_checkpoint_mixed_attn=bool(mot_cfg.get("mot_checkpoint_mixed_attn", True)),
         )
         self.dit = self.mot
+
+    def _build_proprio_encoder(self, proprio_dim: Optional[int]) -> None:
+        if proprio_dim is None:
+            self.proprio_dim = None
+            self.proprio_encoder = None
+            return
+        proprio_dim = int(proprio_dim)
+        if proprio_dim <= 0:
+            raise ValueError(f"`proprio_dim` must be positive or None, got {proprio_dim}.")
+
+        text_dim = int(self.config.framework.world_model.video_dit_config.text_dim)
+        device, dtype = self._model_device_dtype()
+        self.proprio_dim = proprio_dim
+        self.proprio_encoder = nn.Linear(proprio_dim, text_dim).to(device=device, dtype=dtype)
 
     def _build_schedulers(self) -> None:
         """Build FastWAM flow schedulers without adding a separate scheduler module."""
@@ -831,6 +864,88 @@ class FastWAMFramework(baseframework):
         self.train_scheduler = self.train_video_scheduler
         self.infer_scheduler = self.infer_video_scheduler
 
+    def load_checkpoint(self, path: str, optimizer=None, strict: bool = False) -> dict[str, Any]:
+        """Load official FastWAM-style checkpoints into the StarVLA FastWAM modules.
+
+        Official FastWAM saves the trainable joint model under `payload["mot"]`.
+        The `mot` state_dict contains both video and action expert parameters
+        because MoT owns them in its `mixtures` ModuleDict. Legacy Wan-only
+        checkpoints may contain `payload["dit"]`; those are loaded into the
+        video expert only and do not make action inference meaningful.
+        """
+
+        payload = torch.load(path, map_location="cpu", mmap=True)
+        if not isinstance(payload, dict):
+            raise TypeError(f"FastWAM checkpoint must be a dict, got {type(payload)!r}: {path}")
+
+        load_report: dict[str, Any] = {
+            "path": str(path),
+            "loaded": [],
+            "missing_keys": [],
+            "unexpected_keys": [],
+            "step": payload.get("step", None),
+        }
+
+        if "proprio_encoder" in payload:
+            proprio_state = payload["proprio_encoder"]
+            if not isinstance(proprio_state, dict) or "weight" not in proprio_state:
+                raise ValueError("Checkpoint `proprio_encoder` must be a state_dict with a `weight` tensor.")
+            proprio_weight = proprio_state["weight"]
+            if proprio_weight.ndim != 2:
+                raise ValueError(
+                    "Checkpoint `proprio_encoder.weight` must be 2D "
+                    f"[text_dim, proprio_dim], got {tuple(proprio_weight.shape)}."
+                )
+            checkpoint_text_dim, checkpoint_proprio_dim = int(proprio_weight.shape[0]), int(proprio_weight.shape[1])
+            config_text_dim = int(self.config.framework.world_model.video_dit_config.text_dim)
+            if checkpoint_text_dim != config_text_dim:
+                raise ValueError(
+                    "Checkpoint `proprio_encoder` output dim must match FastWAM text_dim: "
+                    f"checkpoint={checkpoint_text_dim}, config={config_text_dim}."
+                )
+            if self.proprio_encoder is None:
+                self._build_proprio_encoder(checkpoint_proprio_dim)
+            elif int(self.proprio_dim) != checkpoint_proprio_dim:
+                raise ValueError(
+                    "Checkpoint `proprio_encoder` input dim does not match configured proprio_dim: "
+                    f"checkpoint={checkpoint_proprio_dim}, config={self.proprio_dim}."
+                )
+
+        if "mot" in payload:
+            incompatible = self.mot.load_state_dict(payload["mot"], strict=bool(strict))
+            load_report["loaded"].append("mot")
+            load_report["missing_keys"] = list(incompatible.missing_keys)
+            load_report["unexpected_keys"] = list(incompatible.unexpected_keys)
+        elif "dit" in payload:
+            logger.warning("Loading legacy `dit` checkpoint into FastWAM video expert only.")
+            incompatible = self.video_expert.load_state_dict(payload["dit"], strict=bool(strict))
+            load_report["loaded"].append("video_expert")
+            load_report["missing_keys"] = list(incompatible.missing_keys)
+            load_report["unexpected_keys"] = list(incompatible.unexpected_keys)
+        else:
+            raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
+
+        if "proprio_encoder" in payload:
+            self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+            load_report["loaded"].append("proprio_encoder")
+            load_report["proprio_dim"] = int(self.proprio_dim)
+
+        if optimizer is not None and "optimizer" in payload:
+            optimizer.load_state_dict(payload["optimizer"])
+            load_report["loaded"].append("optimizer")
+
+        self.loaded_checkpoint = load_report
+        if load_report["missing_keys"] or load_report["unexpected_keys"]:
+            logger.warning(
+                "Loaded FastWAM checkpoint %s with missing_keys=%d unexpected_keys=%d",
+                path,
+                len(load_report["missing_keys"]),
+                len(load_report["unexpected_keys"]),
+            )
+        else:
+            logger.info("Loaded FastWAM checkpoint %s", path)
+        return load_report
+
     @staticmethod
     def _as_tensor(value: Any, *, device: torch.device, dtype: torch.dtype | None = None) -> torch.Tensor:
         if isinstance(value, torch.Tensor):
@@ -845,6 +960,55 @@ class FastWAMFramework(baseframework):
     def _model_device_dtype(self) -> tuple[torch.device, torch.dtype]:
         param = next(self.parameters())
         return param.device, param.dtype
+
+    def _append_proprio_to_context(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        proprio: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.proprio_encoder is None or proprio is None:
+            return context, context_mask
+        if proprio.ndim != 2:
+            raise ValueError(f"`proprio` must be 2D [B,D], got shape {tuple(proprio.shape)}.")
+        if int(proprio.shape[1]) != int(self.proprio_dim):
+            raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}.")
+        if int(proprio.shape[0]) != int(context.shape[0]):
+            raise ValueError(
+                f"`proprio` batch size must match context batch size, got {proprio.shape[0]} vs {context.shape[0]}."
+            )
+
+        proprio_token = self.proprio_encoder(
+            proprio.to(device=context.device, dtype=context.dtype).unsqueeze(1)
+        ).to(dtype=context.dtype)
+        proprio_mask = torch.ones((context_mask.shape[0], 1), dtype=torch.bool, device=context_mask.device)
+        return torch.cat([context, proprio_token], dim=1), torch.cat([context_mask, proprio_mask], dim=1)
+
+    def _normalize_proprio_tensor(
+        self,
+        proprio: Any,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        allow_sequence: bool = True,
+    ) -> torch.Tensor:
+        if self.proprio_encoder is None:
+            raise ValueError("`proprio` was provided but `framework.action_model.proprio_dim` is None.")
+        proprio = self._as_tensor(proprio, device=device, dtype=dtype)
+        if proprio.ndim == 1:
+            proprio = proprio.unsqueeze(0)
+        elif proprio.ndim == 3 and allow_sequence:
+            if proprio.shape[1] < 1:
+                raise ValueError("`proprio` sequence must contain at least one timestep.")
+            proprio = proprio[:, 0, :]
+        if proprio.ndim != 2:
+            raise ValueError(f"`proprio` must be [B,D], [D], or [B,T,D], got shape {tuple(proprio.shape)}.")
+        if int(proprio.shape[0]) != int(batch_size):
+            raise ValueError(f"`proprio` batch size must be {batch_size}, got {proprio.shape[0]}.")
+        if int(proprio.shape[1]) != int(self.proprio_dim):
+            raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}.")
+        return proprio
 
     def _examples_to_sample(self, examples: list[dict]) -> dict[str, Any]:
         if not examples:
@@ -870,7 +1034,7 @@ class FastWAMFramework(baseframework):
                 "or raw `image`/`video` plus `lang`/`prompt` examples."
             )
 
-        for optional_key in ("first_frame_latents", "action_is_pad", "image_is_pad"):
+        for optional_key in ("first_frame_latents", "action_is_pad", "image_is_pad", "proprio", "state"):
             if optional_key in examples[0] and examples[0][optional_key] is not None:
                 sample[optional_key] = torch.stack(
                     [torch.as_tensor(example[optional_key]) for example in examples],
@@ -1048,6 +1212,25 @@ class FastWAMFramework(baseframework):
             raise ValueError(
                 f"`context_mask` length must match context length, got {context_mask.shape[1]} vs {context.shape[1]}"
             )
+
+        proprio = sample.get("proprio", sample.get("state", None))
+        if self.proprio_encoder is not None:
+            if proprio is None:
+                raise ValueError("FastWAM training requires `proprio` or `state` when `proprio_dim` is enabled.")
+            proprio = self._normalize_proprio_tensor(
+                proprio,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                allow_sequence=True,
+            )
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+        elif proprio is not None:
+            raise ValueError("`proprio`/`state` was provided but `framework.action_model.proprio_dim` is None.")
 
         if getattr(self.video_expert, "action_conditioned", False):
             num_latent_frames = int(input_latents.shape[2])
@@ -1278,6 +1461,16 @@ class FastWAMFramework(baseframework):
                 ),
                 "context": torch.stack([torch.as_tensor(example["context"]) for example in examples], dim=0),
                 "context_mask": torch.stack([torch.as_tensor(example["context_mask"]) for example in examples], dim=0),
+                **(
+                    {
+                        "proprio": torch.stack(
+                            [torch.as_tensor(example.get("proprio", example.get("state"))) for example in examples],
+                            dim=0,
+                        )
+                    }
+                    if "proprio" in examples[0] or "state" in examples[0]
+                    else {}
+                ),
             }
         if "input_latents" in examples[0] or "latents" in examples[0]:
             latents_key = "input_latents" if "input_latents" in examples[0] else "latents"
@@ -1288,6 +1481,16 @@ class FastWAMFramework(baseframework):
                 ),
                 "context": torch.stack([torch.as_tensor(example["context"]) for example in examples], dim=0),
                 "context_mask": torch.stack([torch.as_tensor(example["context_mask"]) for example in examples], dim=0),
+                **(
+                    {
+                        "proprio": torch.stack(
+                            [torch.as_tensor(example.get("proprio", example.get("state"))) for example in examples],
+                            dim=0,
+                        )
+                    }
+                    if "proprio" in examples[0] or "state" in examples[0]
+                    else {}
+                ),
             }
         if "image" in examples[0] or "video" in examples[0]:
             image_key = "video" if "video" in examples[0] else "image"
@@ -1306,6 +1509,16 @@ class FastWAMFramework(baseframework):
                 "first_frame_latents": first_frame_latents,
                 "context": context,
                 "context_mask": context_mask,
+                **(
+                    {
+                        "proprio": torch.stack(
+                            [torch.as_tensor(example.get("proprio", example.get("state"))) for example in examples],
+                            dim=0,
+                        )
+                    }
+                    if "proprio" in examples[0] or "state" in examples[0]
+                    else {}
+                ),
             }
         raise ValueError(
             "FastWAM predict_action requires `first_frame_latents/context/context_mask`, "
@@ -1350,6 +1563,28 @@ class FastWAMFramework(baseframework):
             )
         if context.shape[0] != first_frame_latents.shape[0] or context_mask.shape[0] != first_frame_latents.shape[0]:
             raise ValueError("Predict input batch dimensions must match.")
+        if context.shape[1] != context_mask.shape[1]:
+            raise ValueError(
+                f"`context_mask` length must match context length, got {context_mask.shape[1]} vs {context.shape[1]}"
+            )
+        proprio = sample.get("proprio", sample.get("state", None))
+        if self.proprio_encoder is not None:
+            if proprio is None:
+                raise ValueError("FastWAM predict_action requires `proprio` or `state` when `proprio_dim` is enabled.")
+            proprio = self._normalize_proprio_tensor(
+                proprio,
+                batch_size=first_frame_latents.shape[0],
+                device=device,
+                dtype=dtype,
+                allow_sequence=True,
+            )
+            context, context_mask = self._append_proprio_to_context(
+                context=context,
+                context_mask=context_mask,
+                proprio=proprio,
+            )
+        elif proprio is not None:
+            raise ValueError("`proprio`/`state` was provided but `framework.action_model.proprio_dim` is None.")
         return {
             "first_frame_latents": first_frame_latents,
             "context": context,

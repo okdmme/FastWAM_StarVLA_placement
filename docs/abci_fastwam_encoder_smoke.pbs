@@ -1,0 +1,41 @@
+#!/bin/sh
+#PBS -q rt_HG
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -P <ABCI_GROUP>
+#PBS -N fastwam_encoder_smoke
+#PBS -o abci_fastwam_encoder_smoke.log
+#PBS -j oe
+
+set -eu
+
+cd "${PBS_O_WORKDIR}"
+
+if [ -f /etc/profile.d/modules.sh ]; then
+  . /etc/profile.d/modules.sh
+fi
+
+# Adjust these modules to the ABCI environment if needed.
+# module load cuda/12.6/12.6.1
+# module load python/3.11
+
+if [ ! -d ".venv-py311" ]; then
+  echo "Missing .venv-py311. Create the Python environment before submitting this job."
+  exit 1
+fi
+
+. .venv-py311/bin/activate
+
+MODEL_DIR="playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+if [ ! -d "${MODEL_DIR}" ]; then
+  echo "Missing Wan2.2 encoder directory: ${MODEL_DIR}"
+  exit 1
+fi
+
+echo "Python: $(python --version)"
+echo "Working directory: $(pwd)"
+echo "Model directory: ${MODEL_DIR}"
+du -sh "${MODEL_DIR}" || true
+
+FASTWAM_RUN_ENCODER_SMOKE=1 \
+python -m unittest -v tests.test_fastwam_smoke.FastWAMSmokeTest.test_optional_wan2_encoder_load_smoke

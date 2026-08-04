@@ -1,5 +1,6 @@
 import unittest
 import os
+import tempfile
 from pathlib import Path
 
 import torch
@@ -11,9 +12,11 @@ from starVLA.model.framework.base_framework import build_framework
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ENCODER_SMOKE_CONFIG = _REPO_ROOT / "starVLA/config/training/starvla_fastwam_encoder_smoke.yaml"
+_LIBERO_OFFICIAL_INFER_CONFIG = _REPO_ROOT / "starVLA/config/training/starvla_fastwam_libero_official_infer.yaml"
+_ROBOTWIN_OFFICIAL_INFER_CONFIG = _REPO_ROOT / "starVLA/config/training/starvla_fastwam_robotwin_official_infer.yaml"
 
 
-def _tiny_fastwam_cfg(video_attention_mask_mode="bidirectional"):
+def _tiny_fastwam_cfg(video_attention_mask_mode="bidirectional", proprio_dim=None):
     hidden_dim = 8
     text_dim = 6
     action_dim = 3
@@ -46,6 +49,7 @@ def _tiny_fastwam_cfg(video_attention_mask_mode="bidirectional"):
                 "action_model": {
                     "action_dim": action_dim,
                     "state_dim": action_dim,
+                    "proprio_dim": proprio_dim,
                     "action_horizon": 1,
                     "action_dit_config": {
                         "action_dim": action_dim,
@@ -70,6 +74,10 @@ def _tiny_fastwam_cfg(video_attention_mask_mode="bidirectional"):
                     "action_train_shift": 5.0,
                     "action_infer_shift": 5.0,
                     "action_num_train_timesteps": 1000,
+                },
+                "checkpoint": {
+                    "path": None,
+                    "strict": False,
                 },
             }
         }
@@ -201,6 +209,75 @@ class FastWAMSmokeTest(unittest.TestCase):
         self.assertEqual(out["action_loss"].ndim, 0)
         self.assertTrue(torch.isfinite(out["action_loss"]))
 
+    def test_load_official_mot_checkpoint_payload(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "fastwam.pt"
+            torch.save({"mot": model.mot.state_dict(), "step": 7}, ckpt_path)
+
+            reloaded = build_framework(_tiny_fastwam_cfg())
+            report = reloaded.load_checkpoint(str(ckpt_path))
+
+        self.assertEqual(report["loaded"], ["mot"])
+        self.assertEqual(report["step"], 7)
+        self.assertEqual(report["missing_keys"], [])
+        self.assertEqual(report["unexpected_keys"], [])
+        self.assertEqual(reloaded.loaded_checkpoint["path"], str(ckpt_path))
+
+    def test_load_official_checkpoint_payload_with_proprio_encoder(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg(proprio_dim=2))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "fastwam.pt"
+            torch.save(
+                {
+                    "mot": model.mot.state_dict(),
+                    "proprio_encoder": model.proprio_encoder.state_dict(),
+                    "step": 13,
+                },
+                ckpt_path,
+            )
+
+            reloaded = build_framework(_tiny_fastwam_cfg())
+            report = reloaded.load_checkpoint(str(ckpt_path))
+
+        self.assertEqual(report["loaded"], ["mot", "proprio_encoder"])
+        self.assertEqual(report["step"], 13)
+        self.assertEqual(report["proprio_dim"], 2)
+        self.assertIsNotNone(reloaded.proprio_encoder)
+        self.assertEqual(reloaded.proprio_dim, 2)
+
+    def test_checkpoint_config_loads_on_build(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "fastwam.pt"
+            torch.save({"mot": model.mot.state_dict(), "step": 11}, ckpt_path)
+
+            cfg = _tiny_fastwam_cfg()
+            cfg.framework.checkpoint.path = str(ckpt_path)
+            reloaded = build_framework(cfg)
+
+        self.assertIsNotNone(reloaded.loaded_checkpoint)
+        self.assertEqual(reloaded.loaded_checkpoint["loaded"], ["mot"])
+        self.assertEqual(reloaded.loaded_checkpoint["step"], 11)
+
+    def test_load_legacy_dit_checkpoint_payload(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "wan_only.pt"
+            torch.save({"dit": model.video_expert.state_dict(), "step": 3}, ckpt_path)
+
+            reloaded = build_framework(_tiny_fastwam_cfg())
+            report = reloaded.load_checkpoint(str(ckpt_path))
+
+        self.assertEqual(report["loaded"], ["video_expert"])
+        self.assertEqual(report["step"], 3)
+        self.assertEqual(report["missing_keys"], [])
+        self.assertEqual(report["unexpected_keys"], [])
+
     def test_raw_examples_route_through_encoder_adapter(self):
         torch.manual_seed(0)
         model = build_framework(_tiny_fastwam_cfg())
@@ -221,6 +298,46 @@ class FastWAMSmokeTest(unittest.TestCase):
         self.assertIn("action_loss", out)
         self.assertEqual(out["action_loss"].ndim, 0)
         self.assertTrue(torch.isfinite(out["action_loss"]))
+
+    def test_build_inputs_appends_proprio_to_context(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg(proprio_dim=2))
+        batch = {
+            "input_latents": torch.randn(2, 4, 2, 2, 2),
+            "context": torch.randn(2, 5, 6),
+            "context_mask": torch.ones(2, 5, dtype=torch.bool),
+            "proprio": torch.randn(2, 2),
+            "action": torch.randn(2, 1, 3),
+        }
+
+        inputs = model.build_inputs(batch)
+
+        self.assertEqual(tuple(inputs["context"].shape), (2, 6, 6))
+        self.assertEqual(tuple(inputs["context_mask"].shape), (2, 6))
+        self.assertTrue(inputs["context_mask"][:, -1].all())
+
+    def test_predict_action_appends_proprio_to_context(self):
+        torch.manual_seed(0)
+        model = build_framework(_tiny_fastwam_cfg(video_attention_mask_mode="first_frame_causal", proprio_dim=2))
+        examples = [
+            {
+                "first_frame_latents": torch.randn(4, 1, 2, 2),
+                "context": torch.randn(5, 6),
+                "context_mask": torch.ones(5, dtype=torch.bool),
+                "proprio": torch.randn(2),
+            },
+            {
+                "first_frame_latents": torch.randn(4, 1, 2, 2),
+                "context": torch.randn(5, 6),
+                "context_mask": torch.ones(5, dtype=torch.bool),
+                "proprio": torch.randn(2),
+            },
+        ]
+
+        predict_inputs = model._build_predict_inputs(examples)
+
+        self.assertEqual(tuple(predict_inputs["context"].shape), (2, 6, 6))
+        self.assertEqual(tuple(predict_inputs["context_mask"].shape), (2, 6))
 
     def test_raw_examples_require_encoder_loading_or_precomputed_latents(self):
         model = build_framework(_tiny_fastwam_cfg())
@@ -244,6 +361,23 @@ class FastWAMSmokeTest(unittest.TestCase):
         self.assertEqual(cfg.framework.world_model.video_dit_config.in_dim, 48)
         self.assertEqual(cfg.framework.world_model.video_dit_config.text_dim, 4096)
         self.assertEqual(cfg.framework.action_model.action_dit_config.text_dim, 4096)
+
+    def test_official_infer_configs_match_released_checkpoint_shapes(self):
+        libero = OmegaConf.load(_LIBERO_OFFICIAL_INFER_CONFIG)
+        robotwin = OmegaConf.load(_ROBOTWIN_OFFICIAL_INFER_CONFIG)
+
+        self.assertEqual(libero.framework.world_model.video_dit_config.video_attention_mask_mode, "first_frame_causal")
+        self.assertEqual(libero.framework.action_model.action_dim, 7)
+        self.assertEqual(libero.framework.action_model.proprio_dim, 8)
+        self.assertEqual(libero.framework.action_model.action_horizon, 32)
+        self.assertIn("libero_uncond_2cam224.pt", libero.framework.checkpoint.path)
+
+        self.assertEqual(robotwin.framework.world_model.video_dit_config.video_attention_mask_mode, "first_frame_causal")
+        self.assertEqual(robotwin.framework.action_model.action_dim, 14)
+        self.assertEqual(robotwin.framework.world_model.video_dit_config.action_dim, 14)
+        self.assertEqual(robotwin.framework.action_model.proprio_dim, 14)
+        self.assertEqual(robotwin.framework.action_model.action_horizon, 32)
+        self.assertIn("robotwin_uncond_3cam_384.pt", robotwin.framework.checkpoint.path)
 
     def test_optional_wan2_encoder_load_smoke(self):
         if os.environ.get("FASTWAM_RUN_ENCODER_SMOKE") != "1":

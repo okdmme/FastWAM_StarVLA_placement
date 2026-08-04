@@ -1,0 +1,58 @@
+#!/bin/sh
+#PBS -q rt_HG
+#PBS -l select=1
+#PBS -l walltime=02:00:00
+#PBS -P <ABCI_GROUP>
+#PBS -N fastwam_official_infer
+#PBS -o abci_fastwam_official_infer.log
+#PBS -j oe
+
+set -eu
+
+cd "${PBS_O_WORKDIR}"
+
+if [ -f /etc/profile.d/modules.sh ]; then
+  . /etc/profile.d/modules.sh
+fi
+
+# Adjust these modules to your ABCI environment if needed.
+# module load cuda/12.6/12.6.1
+# module load python/3.11
+
+if [ ! -d ".venv-py311" ]; then
+  echo "Missing .venv-py311. Create the Python environment before submitting this job."
+  exit 1
+fi
+
+. .venv-py311/bin/activate
+
+WAN_DIR="playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+CKPT_DIR="checkpoints/fastwam_release"
+
+if [ ! -d "${WAN_DIR}" ]; then
+  echo "Missing Wan2.2 diffusers encoder directory: ${WAN_DIR}"
+  exit 1
+fi
+if [ ! -f "${CKPT_DIR}/libero_uncond_2cam224.pt" ]; then
+  echo "Missing FastWAM LIBERO checkpoint: ${CKPT_DIR}/libero_uncond_2cam224.pt"
+  exit 1
+fi
+
+echo "Python: $(python --version)"
+echo "Working directory: $(pwd)"
+nvidia-smi || true
+du -sh "${WAN_DIR}" "${CKPT_DIR}" || true
+
+python examples/simBenchmarks/LIBERO/eval_files/fastwam_official_infer_smoke.py \
+  --config starVLA/config/training/starvla_fastwam_libero_official_infer.yaml \
+  --mode load \
+  --device cuda \
+  --dtype bfloat16
+
+python examples/simBenchmarks/LIBERO/eval_files/fastwam_official_infer_smoke.py \
+  --config starVLA/config/training/starvla_fastwam_libero_official_infer.yaml \
+  --mode latent \
+  --device cuda \
+  --dtype bfloat16 \
+  --num-inference-steps 1 \
+  --seed 0
