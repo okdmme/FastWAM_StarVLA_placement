@@ -25,6 +25,8 @@ STARVLA_REPO = "https://github.com/okdmme/FastWAM_StarVLA_placement.git"
 STARVLA_COMMIT = "374607be1e26d700f36b8a6f3f9fd30c018af79e"
 OFFICIAL_REPO = "https://github.com/yuantianyuan01/FastWAM.git"
 OFFICIAL_COMMIT = "45d8e1458921d83f8ad6cf9ce993d371208dabd0"
+OFFICIAL_ASSET_REPO = "SereneC/wan-series-checkpoint"
+OFFICIAL_ASSET_REVISION = "fec1e03"
 RUNTIME_DIR = Path("/content/fastwam_parity")
 
 
@@ -88,6 +90,8 @@ def _load_official_model(
     official_dir: Path,
     cfg: Any,
     checkpoint_path: Path,
+    official_assets_dir: Path,
+    tokenizer_dir: Path,
     official_model_id: str,
     official_tokenizer_model_id: str,
     redirect_common_files: bool,
@@ -96,28 +100,61 @@ def _load_official_model(
 ):
     sys.path.insert(0, str(official_dir / "src"))
     from fastwam.models.wan22.fastwam import FastWAM
+    from fastwam.models.wan22.helpers import loader as official_loader
 
-    framework = cfg.framework
-    model = FastWAM.from_wan22_pretrained(
-        device=device,
-        torch_dtype=dtype,
-        model_id=official_model_id,
-        tokenizer_model_id=official_tokenizer_model_id,
-        tokenizer_max_len=int(framework.encoder.text_max_length),
-        load_text_encoder=True,
-        proprio_dim=int(framework.action_model.proprio_dim),
-        redirect_common_files=redirect_common_files,
-        video_dit_config=OmegaConf.to_container(framework.world_model.video_dit_config, resolve=True),
-        action_dit_config=OmegaConf.to_container(framework.action_model.action_dit_config, resolve=True),
-        skip_dit_load_from_pretrain=True,
-        mot_checkpoint_mixed_attn=False,
-        video_train_shift=float(framework.scheduler.video_train_shift),
-        video_infer_shift=float(framework.scheduler.video_infer_shift),
-        video_num_train_timesteps=int(framework.scheduler.video_num_train_timesteps),
-        action_train_shift=float(framework.scheduler.action_train_shift),
-        action_infer_shift=float(framework.scheduler.action_infer_shift),
-        action_num_train_timesteps=int(framework.scheduler.action_num_train_timesteps),
-    )
+    vae_path = official_assets_dir / "DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors"
+    text_path = official_assets_dir / "DiffSynth-Studio/Wan-Series-Converted-Safetensors/models_t5_umt5-xxl-enc-bf16.safetensors"
+    if not vae_path.is_file() or not text_path.is_file():
+        raise FileNotFoundError(
+            "Pinned official encoder assets are missing. Expected:\n"
+            f"  {vae_path}\n  {text_path}\n"
+            "Run the notebook asset-download cell before the inference cell."
+        )
+    if not tokenizer_dir.is_dir():
+        raise FileNotFoundError(f"Official tokenizer directory is missing: {tokenizer_dir}")
+
+    # The pinned official loader hard-codes an obsolete DiffSynth repository.
+    # Supply the same converted files from a pinned public mirror as local
+    # paths, without changing the official model implementation.
+    original_resolve_configs = official_loader._resolve_configs
+
+    def resolve_local_configs(model_id: str, tokenizer_model_id: str, redirect_common_files: bool = True):
+        configs = original_resolve_configs(model_id, tokenizer_model_id, redirect_common_files=False)
+        dit_config, text_config, vae_config, tokenizer_config = configs
+        text_config.path = str(text_path)
+        text_config.model_id = None
+        vae_config.path = str(vae_path)
+        vae_config.model_id = None
+        tokenizer_config.path = str(tokenizer_dir)
+        tokenizer_config.model_id = None
+        return dit_config, text_config, vae_config, tokenizer_config
+
+    official_loader._resolve_configs = resolve_local_configs
+
+    try:
+        framework = cfg.framework
+        model = FastWAM.from_wan22_pretrained(
+            device=device,
+            torch_dtype=dtype,
+            model_id=official_model_id,
+            tokenizer_model_id=official_tokenizer_model_id,
+            tokenizer_max_len=int(framework.encoder.text_max_length),
+            load_text_encoder=True,
+            proprio_dim=int(framework.action_model.proprio_dim),
+            redirect_common_files=redirect_common_files,
+            video_dit_config=OmegaConf.to_container(framework.world_model.video_dit_config, resolve=True),
+            action_dit_config=OmegaConf.to_container(framework.action_model.action_dit_config, resolve=True),
+            skip_dit_load_from_pretrain=True,
+            mot_checkpoint_mixed_attn=False,
+            video_train_shift=float(framework.scheduler.video_train_shift),
+            video_infer_shift=float(framework.scheduler.video_infer_shift),
+            video_num_train_timesteps=int(framework.scheduler.video_num_train_timesteps),
+            action_train_shift=float(framework.scheduler.action_train_shift),
+            action_infer_shift=float(framework.scheduler.action_infer_shift),
+            action_num_train_timesteps=int(framework.scheduler.action_num_train_timesteps),
+        )
+    finally:
+        official_loader._resolve_configs = original_resolve_configs
     model.load_checkpoint(str(checkpoint_path))
     model.eval().to(device=torch.device(device), dtype=dtype)
     return model
@@ -193,6 +230,7 @@ def main() -> None:
     parser.add_argument("--wan-model", default="playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers")
     parser.add_argument("--official-model-id", default="Wan-AI/Wan2.2-TI2V-5B")
     parser.add_argument("--official-tokenizer-model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
+    parser.add_argument("--official-assets-dir", default=None)
     parser.add_argument("--official-redirect-common-files", action="store_true", default=True)
     parser.add_argument(
         "--download-source",
@@ -212,12 +250,23 @@ def main() -> None:
     # a fresh Colab does not fail before the first trace is written.
     os.environ["DIFFSYNTH_DOWNLOAD_SOURCE"] = args.download_source
     metadata = configure_reference_mode(seed=args.seed)
+    metadata.update(
+        {
+            "starvla_start_revision": STARVLA_COMMIT,
+            "official_revision": OFFICIAL_COMMIT,
+            "official_encoder_asset_repo": OFFICIAL_ASSET_REPO,
+            "official_encoder_asset_revision": OFFICIAL_ASSET_REVISION,
+            "official_encoder_asset_mode": "pinned_local_mirror",
+        }
+    )
     starvla_dir, official_dir = ensure_repos(runtime_dir, args.starvla_dir)
 
     cfg_path = starvla_dir / args.config
     cfg = OmegaConf.load(cfg_path)
     checkpoint_path = starvla_dir / args.checkpoint
     stats_path = starvla_dir / args.stats
+    official_assets_dir = Path(args.official_assets_dir) if args.official_assets_dir else runtime_dir / "official_assets"
+    tokenizer_dir = starvla_dir / args.wan_model / "tokenizer"
     dtype = _dtype(args.dtype)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     stats = load_dataset_stats(stats_path)
@@ -254,6 +303,8 @@ def main() -> None:
         official_dir,
         cfg,
         checkpoint_path,
+        official_assets_dir,
+        tokenizer_dir,
         args.official_model_id,
         args.official_tokenizer_model_id,
         bool(args.official_redirect_common_files),
