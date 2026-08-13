@@ -162,6 +162,9 @@ def _load_official_model(
 
 def _official_prepare(model: Any, image: np.ndarray, prompt: str, state: torch.Tensor, trace: TraceWriter):
     x = torch.from_numpy(image).permute(2, 0, 1).to(torch.float32) / 127.5 - 1.0
+    # The official VAE is loaded in the reference dtype (bfloat16 in the
+    # Colab run). Match its input dtype/device before entering Conv3d.
+    x = x.to(device=model.device, dtype=model.torch_dtype)
     trace.tensor("02_preprocessing/official_image_chw_minus1_1", x)
     first_frame_latents = model._encode_input_image_latents_tensor(x)
     context, context_mask = model.encode_prompt(prompt)
