@@ -194,6 +194,12 @@ def main() -> None:
     parser.add_argument("--official-model-id", default="Wan-AI/Wan2.2-TI2V-5B")
     parser.add_argument("--official-tokenizer-model-id", default="Wan-AI/Wan2.1-T2V-1.3B")
     parser.add_argument("--official-redirect-common-files", action="store_true", default=True)
+    parser.add_argument(
+        "--download-source",
+        choices=("huggingface", "modelscope"),
+        default="huggingface",
+        help="Hub used by the pinned official loader for missing Wan components.",
+    )
     parser.add_argument("--prompt", default="pick up the object and place it into the target area")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--num-inference-steps", type=int, default=10)
@@ -202,6 +208,9 @@ def main() -> None:
 
     runtime_dir = Path(args.runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    # The official loader defaults to ModelScope. Pin the source explicitly so
+    # a fresh Colab does not fail before the first trace is written.
+    os.environ["DIFFSYNTH_DOWNLOAD_SOURCE"] = args.download_source
     metadata = configure_reference_mode(seed=args.seed)
     starvla_dir, official_dir = ensure_repos(runtime_dir, args.starvla_dir)
 
