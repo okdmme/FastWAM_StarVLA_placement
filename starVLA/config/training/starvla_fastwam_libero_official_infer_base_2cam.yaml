@@ -1,0 +1,68 @@
+run_id: fastwam_libero_official_infer
+run_root_dir: playground/Checkpoints
+seed: 42
+is_debug: true
+framework:
+  name: FastWAM
+  world_model:
+    base_wm: ./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    video_dit_config:
+      hidden_dim: 3072
+      in_dim: 48
+      ffn_dim: 14336
+      out_dim: 48
+      text_dim: 4096
+      freq_dim: 256
+      eps: 1.0e-06
+      patch_size:
+      - 1
+      - 2
+      - 2
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      has_image_input: false
+      seperated_timestep: true
+      fuse_vae_embedding_in_latents: true
+      action_conditioned: false
+      action_dim: 7
+      video_attention_mask_mode: first_frame_causal
+      use_gradient_checkpointing: false
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    proprio_dim: 8
+    action_horizon: 32
+    action_dit_config:
+      action_dim: 7
+      hidden_dim: 1024
+      ffn_dim: 4096
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      text_dim: 4096
+      freq_dim: 256
+      eps: 1.0e-06
+      use_gradient_checkpointing: false
+  mot:
+    mot_checkpoint_mixed_attn: true
+  scheduler:
+    video_train_shift: 5.0
+    video_infer_shift: 5.0
+    video_num_train_timesteps: 1000
+    action_train_shift: 5.0
+    action_infer_shift: 5.0
+    action_num_train_timesteps: 1000
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+  encoder:
+    load_wan2_encoders: true
+    base_wm: ./playground/Pretrained_models/Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    text_max_length: 512
+    height: 224
+    width: 448
+    num_frames: 1
+  checkpoint:
+    path: ./checkpoints/fastwam_release/libero_uncond_2cam224.pt
+    strict: false

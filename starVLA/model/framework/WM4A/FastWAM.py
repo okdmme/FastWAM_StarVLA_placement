@@ -1498,7 +1498,51 @@ class FastWAMFramework(baseframework):
             for example in examples:
                 sample_images = example[image_key]
                 if isinstance(sample_images, (list, tuple)):
-                    raw_images.append([sample_images[0]])
+                    use_two_camera_concat = (
+                        len(sample_images) == 2
+                        and int(
+                            self.config.framework.encoder.get(
+                                "width", 0
+                            )
+                        ) == 448
+                    )
+
+                    if use_two_camera_concat:
+                        front = np.asarray(sample_images[0])
+                        wrist = np.asarray(sample_images[1])
+
+                        if front.shape != wrist.shape:
+                            raise ValueError(
+                                "FastWAM two-camera image shapes "
+                                "must match: "
+                                f"front={front.shape}, "
+                                f"wrist={wrist.shape}"
+                            )
+
+                        if front.ndim != 3 or front.shape[2] != 3:
+                            raise ValueError(
+                                "FastWAM camera images must be "
+                                "RGB HWC arrays, got "
+                                f"{front.shape}"
+                            )
+
+                        combined = np.concatenate(
+                            [front, wrist],
+                            axis=1,
+                        )
+
+                        expected_shape = (224, 448, 3)
+                        if combined.shape != expected_shape:
+                            raise ValueError(
+                                "Unexpected FastWAM combined "
+                                "camera shape: "
+                                f"{combined.shape}; "
+                                f"expected={expected_shape}"
+                            )
+
+                        raw_images.append([combined])
+                    else:
+                        raw_images.append([sample_images[0]])
                 else:
                     raw_images.append([sample_images])
             first_frame_latents = self._encode_images_to_latents(raw_images)
