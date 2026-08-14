@@ -91,6 +91,17 @@ already records Python, PyTorch, CUDA, and cuDNN versions in both manifests.
 Edit `<ABCI_GROUP>` in `docs/abci_fastwam_exact_core_parity.pbs`, then submit
 from the StarVLA checkout.
 
+First, run the preflight on the login node.  It checks the required Python
+imports, the pinned FastWAM revision, checkpoint/stat files, the converted
+official VAE, and imports the StarVLA framework registry without allocating a
+model.  It exits non-zero and lists every detected issue, so do not submit a
+GPU job until its JSON output says `"ok": true`.
+
+```bash
+source .venv-py311/bin/activate
+python docs/fastwam_parity_preflight.py
+```
+
 ```bash
 cd ~/work/starVLA
 qsub docs/abci_fastwam_exact_core_parity.pbs
