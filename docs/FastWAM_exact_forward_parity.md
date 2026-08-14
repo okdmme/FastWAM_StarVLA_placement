@@ -102,6 +102,10 @@ source .venv-py311/bin/activate
 python docs/fastwam_parity_preflight.py
 ```
 
+The supplied PBS loads ABCI's `python/3.12/3.12.9` module before activating
+the venv.  Keep that line in place: a venv created from a module-provided
+Python needs the module's `libpython` on the compute node as well.
+
 ```bash
 cd ~/work/starVLA
 qsub docs/abci_fastwam_exact_core_parity.pbs

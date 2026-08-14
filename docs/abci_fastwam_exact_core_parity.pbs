@@ -20,9 +20,12 @@ if [ -f /etc/profile.d/modules.sh ]; then
   . /etc/profile.d/modules.sh
 fi
 
-# Adjust to the installed ABCI modules when necessary.
-# module load cuda/12.6/12.6.1
-# module load python/3.11
+# The virtual environment was built with this ABCI Python module.  It must be
+# loaded again on the compute node before activating the venv; otherwise its
+# libpython shared object is not discoverable.
+module load python/3.12/3.12.9
+PYTHON_MODULE_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v python3)")")")"
+export LD_LIBRARY_PATH="${PYTHON_MODULE_ROOT}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 if [ ! -x ".venv-py311/bin/python" ]; then
   echo "Missing .venv-py311 in ${PBS_O_WORKDIR}."
