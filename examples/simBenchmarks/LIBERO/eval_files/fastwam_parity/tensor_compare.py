@@ -32,7 +32,10 @@ class TensorRecord:
 
 def tensor_sha256(tensor: torch.Tensor) -> str:
     cpu = tensor.detach().cpu().contiguous()
-    return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()
+    # NumPy cannot represent torch.bfloat16. Hash the contiguous raw storage
+    # through a byte view so the digest preserves the exact tensor dtype/data.
+    raw_bytes = cpu.view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw_bytes).hexdigest()
 
 
 def save_tensor_record(stage: str, tensor: torch.Tensor, output_dir: Path) -> TensorRecord:
@@ -136,4 +139,3 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             raise ValueError(f"Manifest record {idx} `shape` must be a list.")
         if len(str(record["sha256"])) != 64:
             raise ValueError(f"Manifest record {idx} has invalid sha256: {record['sha256']!r}")
-

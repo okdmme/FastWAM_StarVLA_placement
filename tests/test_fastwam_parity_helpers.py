@@ -12,12 +12,17 @@ from examples.simBenchmarks.LIBERO.eval_files.fastwam_parity.stats import (
 from examples.simBenchmarks.LIBERO.eval_files.fastwam_parity.tensor_compare import (
     compare_tensors,
     save_tensor_record,
+    tensor_sha256,
     validate_manifest,
     write_manifest,
 )
 
 
 class FastWAMParityHelperTest(unittest.TestCase):
+    def test_sha256_supports_bfloat16_raw_bytes(self):
+        value = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+        self.assertEqual(len(tensor_sha256(value)), 64)
+
     def test_compare_tensors_reports_error_and_first_mismatch(self):
         official = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         starvla = torch.tensor([[1.0, 2.0], [3.5, 4.0]])
@@ -66,4 +71,3 @@ class FastWAMParityHelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

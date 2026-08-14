@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from typing import Any
 
 import torch
@@ -23,7 +24,9 @@ def configure_reference_mode(seed: int = 7) -> dict[str, Any]:
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_math_sdp(True)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    # A warning is not sufficient for a bitwise-parity claim.  Fail instead of
+    # silently selecting a known non-deterministic implementation.
+    torch.use_deterministic_algorithms(True, warn_only=False)
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("highest")
 
@@ -32,8 +35,11 @@ def configure_reference_mode(seed: int = 7) -> dict[str, Any]:
         "tf32": False,
         "torch_compile": False,
         "flash_attention": False,
-        "deterministic_algorithms_warn_only": True,
+        "deterministic_algorithms_warn_only": False,
         "torch_version": torch.__version__,
+        "python_version": platform.python_version(),
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
         "cuda_available": torch.cuda.is_available(),
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "cuda_total_vram_bytes": detect_cuda_vram_bytes(),
@@ -51,4 +57,3 @@ def release_cuda_memory() -> None:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-
