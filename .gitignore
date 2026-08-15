@@ -249,6 +249,7 @@ wandb/*
 !docs/model_zoo.md
 !docs/starVLA_guideline.md
 !docs/WM4A.md
+!docs/FastWAM_exact_forward_parity.md
 
 
 logs/*

@@ -1,0 +1,82 @@
+#!/bin/sh
+#PBS -q rt_HG
+#PBS -l select=1
+#PBS -l walltime=03:00:00
+#PBS -P <ABCI_GROUP>
+#PBS -N fastwam_exact_core_parity
+#PBS -o abci_fastwam_exact_core_parity.log
+#PBS -j oe
+
+# Bitwise forward validation of official FastWAM vs the StarVLA FastWAM port.
+#
+# Before submission, replace <ABCI_GROUP>.  The three FASTWAM_* variables may
+# instead be passed to qsub with -v when your directory layout differs.
+
+set -eu
+
+cd "${PBS_O_WORKDIR}"
+
+if [ -f /etc/profile.d/modules.sh ]; then
+  . /etc/profile.d/modules.sh
+fi
+
+# Adjust to the installed ABCI modules when necessary.
+# module load cuda/12.6/12.6.1
+# module load python/3.11
+
+if [ ! -x ".venv-py311/bin/python" ]; then
+  echo "Missing .venv-py311 in ${PBS_O_WORKDIR}."
+  exit 1
+fi
+. .venv-py311/bin/activate
+
+STARVLA_DIR="${PBS_O_WORKDIR}"
+OFFICIAL_DIR="${FASTWAM_OFFICIAL_DIR:-../FastWAM}"
+OFFICIAL_ASSETS_DIR="${FASTWAM_OFFICIAL_ASSETS_DIR:-../fastwam_official_assets}"
+RUNTIME_DIR="${FASTWAM_PARITY_RUNTIME_DIR:-playground/fastwam_parity/exact_core_seed7}"
+CHECKPOINT="${FASTWAM_CHECKPOINT:-checkpoints/fastwam_release/libero_uncond_2cam224.pt}"
+
+if [ ! -d "${OFFICIAL_DIR}/.git" ]; then
+  echo "Official FastWAM checkout is missing: ${OFFICIAL_DIR}"
+  exit 1
+fi
+if [ ! -f "${CHECKPOINT}" ]; then
+  echo "FastWAM checkpoint is missing: ${CHECKPOINT}"
+  exit 1
+fi
+if [ ! -f "${OFFICIAL_ASSETS_DIR}/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors" ]; then
+  echo "Official converted VAE is missing below: ${OFFICIAL_ASSETS_DIR}"
+  echo "See docs/FastWAM_exact_forward_parity.md for the one-time asset download."
+  exit 1
+fi
+
+# These must be exported before Python imports torch/CUDA.  The runner also
+# enables deterministic algorithms with warn_only=False, so unsupported kernels
+# fail rather than silently weakening the exactness claim.
+export PYTHONHASHSEED=7
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVIDIA_TF32_OVERRIDE=0
+export TOKENIZERS_PARALLELISM=false
+export FLASH_ATTENTION_FORCE_DISABLE=1
+export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "StarVLA: $(git rev-parse HEAD)"
+echo "FastWAM: $(git -C "${OFFICIAL_DIR}" rev-parse HEAD)"
+echo "Checkpoint: ${CHECKPOINT}"
+echo "Runtime: ${RUNTIME_DIR}"
+nvidia-smi
+
+python -m examples.simBenchmarks.LIBERO.eval_files.fastwam_parity.colab_orchestrator \
+  --runtime-dir "${RUNTIME_DIR}" \
+  --starvla-dir "${STARVLA_DIR}" \
+  --official-dir "${OFFICIAL_DIR}" \
+  --official-assets-dir "${OFFICIAL_ASSETS_DIR}" \
+  --checkpoint "${CHECKPOINT}" \
+  --input-mode core \
+  --seed 7 \
+  --num-inference-steps 10 \
+  --dtype bfloat16 \
+  --require-exact

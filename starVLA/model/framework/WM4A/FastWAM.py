@@ -1498,7 +1498,51 @@ class FastWAMFramework(baseframework):
             for example in examples:
                 sample_images = example[image_key]
                 if isinstance(sample_images, (list, tuple)):
-                    raw_images.append([sample_images[0]])
+                    use_two_camera_concat = (
+                        len(sample_images) == 2
+                        and int(
+                            self.config.framework.encoder.get(
+                                "width", 0
+                            )
+                        ) == 448
+                    )
+
+                    if use_two_camera_concat:
+                        front = np.asarray(sample_images[0])
+                        wrist = np.asarray(sample_images[1])
+
+                        if front.shape != wrist.shape:
+                            raise ValueError(
+                                "FastWAM two-camera image shapes "
+                                "must match: "
+                                f"front={front.shape}, "
+                                f"wrist={wrist.shape}"
+                            )
+
+                        if front.ndim != 3 or front.shape[2] != 3:
+                            raise ValueError(
+                                "FastWAM camera images must be "
+                                "RGB HWC arrays, got "
+                                f"{front.shape}"
+                            )
+
+                        combined = np.concatenate(
+                            [front, wrist],
+                            axis=1,
+                        )
+
+                        expected_shape = (224, 448, 3)
+                        if combined.shape != expected_shape:
+                            raise ValueError(
+                                "Unexpected FastWAM combined "
+                                "camera shape: "
+                                f"{combined.shape}; "
+                                f"expected={expected_shape}"
+                            )
+
+                        raw_images.append([combined])
+                    else:
+                        raw_images.append([sample_images[0]])
                 else:
                     raw_images.append([sample_images])
             first_frame_latents = self._encode_images_to_latents(raw_images)
@@ -1602,6 +1646,9 @@ class FastWAMFramework(baseframework):
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
         rand_device: str = "cpu",
+        initial_action_noise: Optional[torch.Tensor] = None,
+        infer_timesteps_action: Optional[torch.Tensor] = None,
+        infer_deltas_action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -1610,13 +1657,25 @@ class FastWAMFramework(baseframework):
             raise ValueError(f"`action_horizon` must be positive, got {action_horizon}.")
 
         batch_size = int(first_frame_latents.shape[0])
-        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (batch_size, int(action_horizon), self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=first_frame_latents.device, dtype=first_frame_latents.dtype)
+        if initial_action_noise is None:
+            generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+            latents_action = torch.randn(
+                (batch_size, int(action_horizon), self.action_expert.action_dim),
+                generator=generator,
+                device=rand_device,
+                dtype=torch.float32,
+            ).to(device=first_frame_latents.device, dtype=first_frame_latents.dtype)
+        else:
+            latents_action = initial_action_noise.to(
+                device=first_frame_latents.device,
+                dtype=first_frame_latents.dtype,
+            ).clone()
+            expected_shape = (batch_size, int(action_horizon), int(self.action_expert.action_dim))
+            if tuple(latents_action.shape) != expected_shape:
+                raise ValueError(
+                    "`initial_action_noise` shape mismatch: "
+                    f"got {tuple(latents_action.shape)}, expected {expected_shape}."
+                )
 
         timestep_video = torch.zeros(
             (batch_size,),
@@ -1649,12 +1708,27 @@ class FastWAMFramework(baseframework):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
-        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
-            num_inference_steps=int(num_inference_steps),
-            device=first_frame_latents.device,
-            dtype=latents_action.dtype,
-            shift_override=sigma_shift,
-        )
+        if infer_timesteps_action is None or infer_deltas_action is None:
+            infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+                num_inference_steps=int(num_inference_steps),
+                device=first_frame_latents.device,
+                dtype=latents_action.dtype,
+                shift_override=sigma_shift,
+            )
+        else:
+            infer_timesteps_action = infer_timesteps_action.to(
+                device=first_frame_latents.device,
+                dtype=latents_action.dtype,
+            )
+            infer_deltas_action = infer_deltas_action.to(
+                device=first_frame_latents.device,
+                dtype=latents_action.dtype,
+            )
+            if int(infer_timesteps_action.numel()) != int(infer_deltas_action.numel()):
+                raise ValueError(
+                    "`infer_timesteps_action` and `infer_deltas_action` must have the same length, "
+                    f"got {infer_timesteps_action.numel()} and {infer_deltas_action.numel()}."
+                )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.expand(batch_size).to(
                 dtype=latents_action.dtype,
@@ -1690,5 +1764,8 @@ class FastWAMFramework(baseframework):
             sigma_shift=kwargs.get("sigma_shift", None),
             seed=kwargs.get("seed", None),
             rand_device=kwargs.get("rand_device", "cpu"),
+            initial_action_noise=kwargs.get("initial_action_noise", None),
+            infer_timesteps_action=kwargs.get("infer_timesteps_action", None),
+            infer_deltas_action=kwargs.get("infer_deltas_action", None),
         )
         return {"normalized_actions": np.asarray(actions)}
